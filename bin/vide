@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Launch Vim with the vide workspace sidebar.  Bash is available on systems
+# where zsh is common too, so this remains usable from either shell.
+set -euo pipefail
+
+vide_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+if [[ -z "${VIDE_VIM:-}" && -x "$vide_dir/vim-master/src/vim" ]]; then
+    vim_bin="$vide_dir/vim-master/src/vim"
+    export VIMRUNTIME="$vide_dir/vim-master/runtime"
+else
+    vim_bin="${VIDE_VIM:-vim}"
+fi
+
+if ! command -v "$vim_bin" >/dev/null 2>&1; then
+    printf 'vide: cannot find Vim executable: %s\n' "$vim_bin" >&2
+    exit 127
+fi
+
+exec "$vim_bin" -Nu "$vide_dir/src/vide.vim" -U NONE -N -i NONE "$@"
