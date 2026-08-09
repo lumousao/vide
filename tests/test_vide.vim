@@ -36,6 +36,7 @@ execute "normal \<CR>"
 call assert_match('child.txt', join(getline(1, '$'), "\n"))
 call assert_equal(2, winnr('$'))
 call assert_equal('nofile', &l:buftype)
+call assert_equal(0, &l:wrap)
 call assert_equal('', maparg('<LeftMouse>', 'n'))
 call assert_match('MouseActivate', maparg('<LeftRelease>', 'n'))
 call assert_match('Interrupt', maparg('<C-C>', 'n'))
@@ -79,10 +80,55 @@ call assert_match('inside.txt$', getline('.'))
 call assert_match('created', join(getline(1, '$'), "\n"))
 call assert_true(len(filter(getmatches(), 'v:val.group ==# "VideChanged"')) > 0)
 
+" Deleting and recreating a directory must clear all old path state.
+call mkdir(s:root . '/cycle')
+call writefile(['cycle before'], s:root . '/cycle/file.txt')
+sleep 500m
+call delete(s:root . '/cycle', 'rf')
+sleep 500m
+call assert_false(isdirectory(s:root . '/cycle'))
+call mkdir(s:root . '/cycle')
+call writefile(['cycle after'], s:root . '/cycle/file.txt')
+sleep 700m
+call assert_equal(s:root . '/cycle/file.txt', expand('%:p'))
+
+" Moving a directory away and back establishes fresh state at the new path.
+call mkdir(s:root . '/move-src')
+call writefile(['move before'], s:root . '/move-src/item.txt')
+sleep 400m
+call rename(s:root . '/move-src', s:root . '/move-dst')
+sleep 500m
+call rename(s:root . '/move-dst', s:root . '/move-src')
+call writefile(['move after'], s:root . '/move-src/item.txt')
+sleep 700m
+call assert_equal(s:root . '/move-src/item.txt', expand('%:p'))
+
+" A WRITE event remains valid when size and mtime are unchanged.
+call writefile(['same-size-a'], s:root . '/same-size.txt')
+sleep 300m
+let s:mtime = getftime(s:root . '/same-size.txt')
+call writefile(['same-size-b'], s:root . '/same-size.txt')
+if exists('*setftime')
+  call setftime(s:mtime, s:root . '/same-size.txt')
+endif
+sleep 700m
+call assert_equal(s:root . '/same-size.txt', expand('%:p'))
+call assert_equal('same-size-b', getline(1))
+
 " A lexical child path through a link must be rejected before filesystem writes.
 call system('ln -s /tmp ' . shellescape(s:root . '/link'))
 let s:script_id = matchstr(execute('function /SafeChildPath'), '<SNR>\zs\d\+\ze_')
 execute 'call assert_equal('''', <SNR>' . s:script_id . '_SafeChildPath(' . string(s:root) . ', ''link/escape.txt''))'
+
+" Secure file operations use the descriptor-based helper.
+let s:fs_script_id = s:script_id
+execute 'call assert_true(<SNR>' . s:fs_script_id . '_FsCall(''create-dir'', [''managed'']))'
+execute 'call assert_true(<SNR>' . s:fs_script_id . '_FsCall(''create-file'', [''managed/note.txt'']))'
+call assert_true(filereadable(s:root . '/managed/note.txt'))
+execute 'call assert_true(<SNR>' . s:fs_script_id . '_FsCall(''rename'', [''managed/note.txt'', ''managed/renamed.txt'']))'
+call assert_true(filereadable(s:root . '/managed/renamed.txt'))
+execute 'call assert_true(<SNR>' . s:fs_script_id . '_FsCall(''delete'', [''managed'']))'
+call assert_false(isdirectory(s:root . '/managed'))
 
 if len(v:errors)
   cquit

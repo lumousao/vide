@@ -4,6 +4,11 @@ if exists('g:loaded_vide_runtime')
 endif
 let g:loaded_vide_runtime = 1
 
+let s:module_dir = expand('<sfile>:p:h') . '/vide'
+for s:module in ['core.vim', 'tree.vim', 'watch.vim', 'fs.vim', 'settings.vim', 'ui.vim', 'ignore.vim']
+  execute 'silent source ' . fnameescape(s:module_dir . '/' . s:module)
+endfor
+
 set nocompatible
 set mouse=a
 filetype plugin indent on
@@ -15,7 +20,7 @@ let s:tree_win = -1
 let s:editor_win = -1
 let s:watching = 0
 let s:expanded = {s:root: 1}
-let s:watch = {'signatures': {}, 'hashes': {}, 'contents': {}}
+let s:watch = {'baseline': {}, 'signatures': {}, 'hashes': {}, 'contents': {}, 'snapshot_sizes': {}, 'diffs': {}}
 let s:content_limit = 262144
 let s:snapshot_budget = 8388608
 let s:snapshot_bytes = 0
@@ -25,12 +30,17 @@ let s:changed_line = 1
 let s:selected_path = ''
 let s:watch_job = 0
 let s:watcher_stopping = 0
+let s:watch_error = 0
 let s:stopped_watch_jobs = {}
 let s:watch_buffer = ''
 let s:pending_events = []
 let s:initializing = 0
-let s:watcher_path = get(g:, 'vide_watcher', expand('<sfile>:p:h:h') . '/bin/vide-watch')
+let s:exe_suffix = has('win32') ? '.exe' : ''
+let s:watcher_path = get(g:, 'vide_watcher', expand('<sfile>:p:h:h') . '/bin/vide-watch' . s:exe_suffix)
+let s:fs_path = get(g:, 'vide_fs', expand('<sfile>:p:h:h') . '/bin/vide-fs' . s:exe_suffix)
 let s:notice = ''
+let s:ignore_patterns = ['^\.git\%(/\|$\)', '^node_modules\%(/\|$\)', '^__pycache__\%(/\|$\)']
+let g:vide_ignore_patterns = []
 let g:vide_notice = ''
 let s:interrupt_armed = 0
 let s:interrupt_timer = -1
@@ -39,7 +49,8 @@ let s:settings_popup = -1
 let s:settings = {
       \ 'sidebar_percent': 34,
       \ 'content_limit_kb': 256,
-      \ 'snapshot_budget_kb': 8192}
+      \ 'snapshot_budget_kb': 8192,
+      \ 'marker_style': 'auto'}
 let g:vide_watch_backend = 'OFF'
 
 highlight default VideChanged cterm=bold ctermfg=Black ctermbg=DarkYellow gui=bold guifg=Black guibg=DarkYellow
@@ -117,7 +128,12 @@ function! s:DisplayName(path) abort
 endfunction
 
 function! s:TreeMarker(path) abort
-  if &encoding =~? 'utf-8'
+  let l:style = get(s:settings, 'marker_style', 'auto')
+  let l:locale = tolower($LC_ALL . ' ' . $LC_CTYPE . ' ' . $LANG . ' ' . &termencoding)
+  let l:unicode = l:style ==# 'unicode' ||
+        \ (l:style ==# 'auto' && has('multi_byte') &&
+        \ l:locale =~# 'utf[-_]\?8')
+  if l:unicode
     return has_key(s:expanded, a:path) ? '▼' : '▶'
   endif
   return has_key(s:expanded, a:path) ? 'v' : '>'
@@ -150,15 +166,12 @@ function! s:SettingsFile() abort
 endfunction
 
 function! s:ValidateSettings() abort
-  if has_key(s:settings, 'poll_ms')
-    call remove(s:settings, 'poll_ms')
-  endif
-  if has_key(s:settings, 'watch_mode')
-    call remove(s:settings, 'watch_mode')
-  endif
   let s:settings.sidebar_percent = min([60, max([20, str2nr(string(get(s:settings, 'sidebar_percent', 34)))])])
   let s:settings.content_limit_kb = min([4096, max([64, str2nr(string(get(s:settings, 'content_limit_kb', 256)))])])
   let s:settings.snapshot_budget_kb = min([65536, max([1024, str2nr(string(get(s:settings, 'snapshot_budget_kb', 8192)))])])
+  if index(['auto', 'unicode', 'ascii'], get(s:settings, 'marker_style', 'auto')) < 0
+    let s:settings.marker_style = 'auto'
+  endif
   let s:content_limit = s:settings.content_limit_kb * 1024
   let s:snapshot_budget = s:settings.snapshot_budget_kb * 1024
   let g:vide_settings = deepcopy(s:settings)
@@ -235,7 +248,10 @@ endfunction
 
 function! s:PruneWatch(path) abort
   let l:path = s:NormalizePath(a:path)
-  for l:store in [s:watch.signatures, s:watch.hashes, s:watch.contents, get(s:watch, 'snapshot_sizes', {})]
+  if !has_key(s:watch, 'snapshot_sizes')
+    let s:watch.snapshot_sizes = {}
+  endif
+  for l:store in [s:watch.baseline, s:watch.signatures, s:watch.hashes, s:watch.contents, s:watch.snapshot_sizes, s:watch.diffs]
     for l:key in keys(l:store)
       if l:key ==# l:path || stridx(l:key, l:path . '/') ==# 0
         call remove(l:store, l:key)
@@ -247,6 +263,17 @@ function! s:PruneWatch(path) abort
     let s:snapshot_bytes += l:size
   endfor
   call filter(s:snapshot_order, 'v:val !=# l:path && stridx(v:val, l:path . "/") !=# 0')
+  for l:key in keys(s:expanded)
+    if l:key ==# l:path || stridx(l:key, l:path . '/') ==# 0
+      call remove(s:expanded, l:key)
+    endif
+  endfor
+  if s:selected_path ==# l:path || stridx(s:selected_path, l:path . '/') ==# 0
+    let s:selected_path = ''
+  endif
+  if s:changed_path ==# l:path || stridx(s:changed_path, l:path . '/') ==# 0
+    let s:changed_path = ''
+  endif
 endfunction
 
 function! s:RemapPaths(store, old, new) abort
@@ -260,7 +287,7 @@ endfunction
 
 function! s:SafeChildPath(parent, name) abort
   let l:name = a:name
-  if empty(l:name) || l:name =~# '^/' || l:name =~# '[[:cntrl:]]'
+  if empty(l:name) || l:name =~# '^/'
     return ''
   endif
   for l:part in split(l:name, '/', 1)
@@ -277,6 +304,62 @@ function! s:SafeChildPath(parent, name) abort
   return s:HasSymlinkComponent(fnamemodify(l:path, ':h')) ? '' : l:path
 endfunction
 
+function! s:RelativePath(path) abort
+  let l:path = s:NormalizePath(a:path)
+  return l:path ==# s:root ? '' : strpart(l:path, strlen(s:root) + 1)
+endfunction
+
+function! s:LoadIgnorePatterns() abort
+  let s:ignore_patterns = ['^\.git\%(/\|$\)', '^node_modules\%(/\|$\)', '^__pycache__\%(/\|$\)']
+  let l:file = s:root . '/.videignore'
+  if filereadable(l:file)
+    for l:line in readfile(l:file)
+      let l:line = trim(l:line)
+      if empty(l:line) || l:line[0] ==# '#'
+        continue
+      endif
+      " Patterns are relative to the project root; accept plain globs and
+      " regular expressions without allowing them to escape the root.
+      let l:pattern = substitute(l:line, '/\*$', '', '')
+      let l:pattern = escape(l:pattern, '\.^$~[]')
+      let l:pattern = substitute(l:pattern, '\*', '.*', 'g')
+      call add(s:ignore_patterns, '^' . l:pattern . '\%(/\|$\)')
+    endfor
+  endif
+  let g:vide_ignore_patterns = deepcopy(s:ignore_patterns)
+endfunction
+
+function! s:ShouldIgnore(path) abort
+  let l:relative = s:RelativePath(a:path)
+  if empty(l:relative)
+    return 0
+  endif
+  for l:pattern in s:ignore_patterns
+    if l:relative =~# l:pattern
+      return 1
+    endif
+  endfor
+  return 0
+endfunction
+
+function! s:FsCall(operation, paths) abort
+  if !executable(s:fs_path)
+    call s:TreeError('file operation helper is unavailable; run make fs')
+    return 0
+  endif
+  let l:parts = [shellescape(s:fs_path), shellescape(s:root), shellescape(a:operation)]
+  for l:path in a:paths
+    call add(l:parts, shellescape(s:RelativePath(l:path)))
+  endfor
+  let l:output = system(join(l:parts, ' '))
+  if v:shell_error != 0 || l:output !~# '^OK\%($\|\n\)'
+    let l:message = substitute(l:output, '\n\+$', '', '')
+    call s:TreeError(empty(l:message) ? 'secure filesystem operation failed' : l:message)
+    return 0
+  endif
+  return 1
+endfunction
+
 function! s:ComparePaths(left, right) abort
   let l:left_dir = s:IsDirectory(a:left)
   let l:right_dir = s:IsDirectory(a:right)
@@ -289,15 +372,33 @@ function! s:ComparePaths(left, right) abort
 endfunction
 
 function! s:Children(path) abort
-  let l:entries = globpath(a:path, '*', 0, 1) + globpath(a:path, '.*', 0, 1)
   let l:result = []
-  for l:entry in l:entries
-    let l:normalized = s:NormalizePath(l:entry)
-    let l:name = fnamemodify(l:entry, ':t')
-    if l:name !=# '.' && l:name !=# '..' && l:normalized !=# s:root && l:normalized !=# fnamemodify(s:root, ':h') && !s:IsTransient(l:entry)
-      call add(l:result, l:normalized)
+  try
+    if exists('*readdirex')
+      for l:item in readdirex(a:path)
+        let l:name = get(l:item, 'name', '')
+        if empty(l:name) || l:name ==# '.' || l:name ==# '..'
+          continue
+        endif
+        let l:normalized = s:NormalizePath(a:path . '/' . l:name)
+        if l:normalized !=# s:root && l:normalized !=# fnamemodify(s:root, ':h') && !s:IsTransient(l:normalized) && !s:ShouldIgnore(l:normalized)
+          call add(l:result, l:normalized)
+        endif
+      endfor
+    else
+      for l:name in readdir(a:path)
+        if l:name ==# '.' || l:name ==# '..'
+          continue
+        endif
+        let l:normalized = s:NormalizePath(a:path . '/' . l:name)
+        if l:normalized !=# s:root && l:normalized !=# fnamemodify(s:root, ':h') && !s:IsTransient(l:normalized) && !s:ShouldIgnore(l:normalized)
+          call add(l:result, l:normalized)
+        endif
+      endfor
     endif
-  endfor
+  catch /^Vim\%((\a\+))\=:E/
+    return []
+  endtry
   return sort(l:result, function('s:ComparePaths'))
 endfunction
 
@@ -419,6 +520,12 @@ function! s:OpenFile(path, line) abort
   if l:winid < 0 || !win_gotoid(l:winid)
     return
   endif
+  if &modified && expand('%:p') ==# a:path
+    " Never issue :edit on the active unsaved buffer: that would trigger an
+    " interactive E37 prompt from the asynchronous watcher callback.
+    call s:TreeError('external change detected; unsaved buffer preserved')
+    return
+  endif
   if &modified && expand('%:p') !=# a:path
     " Preserve local work while still honoring an external-change jump.
     rightbelow new
@@ -481,33 +588,20 @@ function! s:CreateNode() abort
   let l:name = input('Create relative path: ')
   let l:path = s:SafeChildPath(l:parent, l:name)
   if empty(l:path)
-    call s:TreeError('path must stay inside the project and contain no control characters')
-    return
-  endif
-  if filereadable(l:path) || isdirectory(l:path) || getftype(l:path) !=# ''
-    call s:TreeError('target already exists')
+    call s:TreeError('path must stay inside the project')
     return
   endif
   let l:kind = confirm('Create ' . fnamemodify(l:path, ':t') . ' as:', "&File\n&Directory\n&Cancel", 3)
   if l:kind == 3 || l:kind == 0
     return
   endif
-  try
-    if empty(s:SafeChildPath(l:parent, l:name))
-      call s:TreeError('path changed or now contains a symbolic link')
-      return
-    endif
-    if l:kind == 1
-      call mkdir(fnamemodify(l:path, ':h'), 'p')
-      call writefile([], l:path)
-      call s:RememberPath(l:path)
-    else
-      call mkdir(l:path, 'p')
-    endif
-  catch /^Vim\%((\a\+)\)\=:E/
-    call s:TreeError('could not create target')
+  let l:operation = l:kind == 1 ? 'create-file' : 'create-dir'
+  if !s:FsCall(l:operation, [l:path])
     return
-  endtry
+  endif
+  if l:kind == 1
+    call s:RememberPath(l:path)
+  endif
   call s:Reveal(l:path)
   let s:selected_path = l:path
   call s:Render()
@@ -526,8 +620,7 @@ function! s:DeleteNode() abort
   if confirm(l:question, "&Cancel\n&Delete", 1) != 2
     return
   endif
-  if delete(l:node.path, l:node.dir ? 'rf' : '') != 0
-    call s:TreeError('delete failed')
+  if !s:FsCall('delete', [l:node.path])
     return
   endif
   call s:PruneWatch(l:node.path)
@@ -560,23 +653,16 @@ function! s:RenameNode() abort
   if l:new ==# l:old
     return
   endif
-  if getftype(l:new) !=# ''
-    call s:TreeError('target already exists')
-    return
-  endif
-  if empty(s:SafeChildPath(fnamemodify(l:old, ':h'), l:name))
-    call s:TreeError('path changed or now contains a symbolic link')
-    return
-  endif
-  if rename(l:old, l:new) != 0
-    call s:TreeError('rename failed')
+  if !s:FsCall('rename', [l:old, l:new])
     return
   endif
   call s:RemapPaths(s:expanded, l:old, l:new)
+  call s:RemapPaths(s:watch.baseline, l:old, l:new)
   call s:RemapPaths(s:watch.signatures, l:old, l:new)
   call s:RemapPaths(s:watch.hashes, l:old, l:new)
   call s:RemapPaths(s:watch.contents, l:old, l:new)
   call s:RemapPaths(s:watch.snapshot_sizes, l:old, l:new)
+  call s:RemapPaths(s:watch.diffs, l:old, l:new)
   let s:snapshot_order = map(s:snapshot_order, 'v:val ==# l:old || stridx(v:val, l:old . "/") ==# 0 ? l:new . strpart(v:val, strlen(l:old)) : v:val')
   if s:changed_path ==# l:old || stridx(s:changed_path, l:old . '/') ==# 0
     let s:changed_path = l:new . strpart(s:changed_path, strlen(l:old))
@@ -589,22 +675,12 @@ function! s:RenameNode() abort
 endfunction
 
 function! s:CanWatch(path) abort
-  return a:path !~# '/\.git\%(/\|$\)' && !s:IsTransient(a:path) && filereadable(a:path)
-endfunction
-
-function! s:ReadContents(path) abort
-  if getfsize(a:path) < 0 || getfsize(a:path) > s:content_limit
-    return []
-  endif
-  try
-    return readfile(a:path)
-  catch /^Vim\%((\a\+)\)\=:E/
-    return []
-  endtry
+  return a:path !~# '/\.git\%(/\|$\)' && !s:IsTransient(a:path) &&
+        \ !s:ShouldIgnore(a:path) && getftype(a:path) !=# 'link' && filereadable(a:path)
 endfunction
 
 function! s:CollectFiles(path, files) abort
-  if a:path =~# '/\.git\%(/\|$\)'
+  if a:path =~# '/\.git\%(/\|$\)' || s:ShouldIgnore(a:path)
     return
   endif
   for l:entry in s:Children(a:path)
@@ -616,16 +692,24 @@ function! s:CollectFiles(path, files) abort
   endfor
 endfunction
 
-function! s:ContentSignature(path) abort
+function! s:ReadSnapshot(path) abort
   let l:size = getfsize(a:path)
   if l:size < 0 || l:size > s:content_limit
-    return ''
+    return {'contents': [], 'hash': '', 'size': l:size}
   endif
   try
-    return sha256(join(readfile(a:path, 'b'), "\n"))
+    let l:contents = readfile(a:path, 'b')
+    return {'contents': l:contents, 'hash': sha256(join(l:contents, "\n")), 'size': l:size}
   catch /^Vim\%((\a\+)\)\=:E/
-    return ''
+    return {'contents': [], 'hash': '', 'size': l:size}
   endtry
+endfunction
+
+function! s:SnapshotCost(contents, size) abort
+  if a:size < 0
+    return 0
+  endif
+  return a:size + len(a:contents) * 32 + 64
 endfunction
 
 function! s:CollectWatch() abort
@@ -634,8 +718,11 @@ function! s:CollectWatch() abort
   let l:signatures = {}
   let l:hashes = {}
   let l:contents = {}
+  let l:baseline = {}
   let l:sizes = {}
+  let l:diffs = {}
   let l:bytes = 0
+  let s:snapshot_order = []
   call s:CollectFiles(s:root, l:files)
   for l:path in l:files
     if !s:CanWatch(l:path)
@@ -643,16 +730,22 @@ function! s:CollectWatch() abort
     endif
     let l:size = getfsize(l:path)
     let l:signatures[l:path] = getftime(l:path) . ':' . l:size
-    if l:size >= 0 && l:size <= s:content_limit && l:bytes + l:size <= s:snapshot_budget
-      let l:hashes[l:path] = s:ContentSignature(l:path)
-      let l:contents[l:path] = s:ReadContents(l:path)
-      let l:sizes[l:path] = l:size
+    if l:size >= 0 && l:size <= s:content_limit
+      let l:snapshot = s:ReadSnapshot(l:path)
+      let l:cost = s:SnapshotCost(l:snapshot.contents, l:snapshot.size)
+      if l:bytes + l:cost > s:snapshot_budget
+        continue
+      endif
+      let l:hashes[l:path] = l:snapshot.hash
+      let l:contents[l:path] = l:snapshot.contents
+      let l:baseline[l:path] = {'hash': l:snapshot.hash, 'size': l:snapshot.size}
+      let l:sizes[l:path] = l:cost
       call add(s:snapshot_order, l:path)
-      let l:bytes += l:size
+      let l:bytes += l:cost
     endif
   endfor
   let s:snapshot_bytes = l:bytes
-  return {'signatures': l:signatures, 'hashes': l:hashes, 'contents': l:contents, 'snapshot_sizes': l:sizes}
+  return {'baseline': l:baseline, 'signatures': l:signatures, 'hashes': l:hashes, 'contents': l:contents, 'snapshot_sizes': l:sizes, 'diffs': l:diffs}
 endfunction
 
 function! s:StoreSnapshot(path, contents) abort
@@ -666,10 +759,12 @@ function! s:StoreSnapshot(path, contents) abort
     call remove(s:watch.snapshot_sizes, a:path)
   endif
   call filter(s:snapshot_order, 'v:val !=# a:path')
-  if getfsize(a:path) >= 0 && getfsize(a:path) <= s:content_limit
+  let l:size = getfsize(a:path)
+  let l:cost = s:SnapshotCost(a:contents, l:size)
+  if l:size >= 0 && l:size <= s:content_limit
     let s:watch.contents[a:path] = a:contents
-    let s:watch.snapshot_sizes[a:path] = getfsize(a:path)
-    let s:snapshot_bytes += getfsize(a:path)
+    let s:watch.snapshot_sizes[a:path] = l:cost
+    let s:snapshot_bytes += l:cost
     call add(s:snapshot_order, a:path)
   else
     if has_key(s:watch.contents, a:path)
@@ -684,6 +779,11 @@ function! s:StoreSnapshot(path, contents) abort
   endwhile
 endfunction
 
+function! s:SnapshotStats() abort
+  return {'files': len(get(s:watch, 'contents', {})),
+        \ 'bytes': s:snapshot_bytes, 'budget': s:snapshot_budget}
+endfunction
+
 function! s:FirstChangedLine(before, after) abort
   let l:limit = min([len(a:before), len(a:after)])
   for l:index in range(0, l:limit - 1)
@@ -694,22 +794,57 @@ function! s:FirstChangedLine(before, after) abort
   return l:limit + 1
 endfunction
 
+function! s:BuildDiff(before, after) abort
+  let l:diff = []
+  let l:limit = max([len(a:before), len(a:after)])
+  if l:limit == 0
+    return l:diff
+  endif
+  for l:index in range(0, l:limit - 1)
+    let l:old = l:index < len(a:before) ? a:before[l:index] : v:null
+    let l:new = l:index < len(a:after) ? a:after[l:index] : v:null
+    if l:old !=# l:new
+      call add(l:diff, {'type': l:old is# v:null ? 'insert' : l:new is# v:null ? 'delete' : 'change',
+            \ 'line': l:index + 1, 'before': l:old, 'after': l:new})
+    endif
+  endfor
+  return l:diff
+endfunction
+
 function! s:RememberPath(path) abort
   let l:path = s:NormalizePath(a:path)
   if !s:CanWatch(l:path)
     return
   endif
+  let l:snapshot = s:ReadSnapshot(l:path)
   let s:watch.signatures[l:path] = getftime(l:path) . ':' . getfsize(l:path)
-  let s:watch.hashes[l:path] = s:ContentSignature(l:path)
-  call s:StoreSnapshot(l:path, s:ReadContents(l:path))
+  let s:watch.hashes[l:path] = l:snapshot.hash
+  if !has_key(s:watch, 'baseline')
+    let s:watch.baseline = {}
+  endif
+  if !has_key(s:watch.baseline, l:path)
+    let s:watch.baseline[l:path] = {'hash': l:snapshot.hash, 'size': l:snapshot.size}
+  endif
+  call s:StoreSnapshot(l:path, l:snapshot.contents)
 endfunction
 
-function! s:HandleChangedPath(path) abort
+function! s:HandleChangedPath(path, kind) abort
+  let l:kind = a:kind
   let l:path = s:NormalizePath(a:path)
-  if empty(l:path) || stridx(l:path, s:root . '/') !=# 0 || l:path =~# '/\.git\%(/\|$\)'
+  if empty(l:path) || (l:path !=# s:root && stridx(l:path, s:root . '/') !=# 0) || l:path =~# '/\.git\%(/\|$\)'
     return
   endif
-  if s:IsDirectory(l:path)
+  if l:path ==# s:root && index(['MOVE_OUT', 'DELETE', 'ROOT_LOST'], l:kind) >= 0
+    let g:vide_watch_backend = 'OFF'
+    call s:TreeError('project root was removed or moved')
+    return
+  endif
+  if index(['MOVE_OUT', 'DELETE'], l:kind) >= 0
+    call s:PruneWatch(l:path)
+    call s:Render()
+    return
+  endif
+  if l:kind ==# 'DIR' || s:IsDirectory(l:path)
     call s:Render()
     return
   endif
@@ -717,34 +852,32 @@ function! s:HandleChangedPath(path) abort
     if s:selected_path ==# l:path
       let s:selected_path = ''
     endif
-    if has_key(s:watch.signatures, l:path)
-      call remove(s:watch.signatures, l:path)
-    endif
-    if has_key(s:watch.hashes, l:path)
-      call remove(s:watch.hashes, l:path)
-    endif
-    if has_key(s:watch.contents, l:path)
-      call remove(s:watch.contents, l:path)
-    endif
-    if has_key(get(s:watch, 'snapshot_sizes', {}), l:path)
-      let s:snapshot_bytes -= s:watch.snapshot_sizes[l:path]
-      call remove(s:watch.snapshot_sizes, l:path)
-    endif
-    call filter(s:snapshot_order, 'v:val !=# l:path')
+    call s:PruneWatch(l:path)
     call s:Render()
     return
   endif
 
   let l:signature = getftime(l:path) . ':' . getfsize(l:path)
-  let l:hash = s:ContentSignature(l:path)
-  if get(s:watch.signatures, l:path, '') ==# l:signature
+  let l:snapshot = s:ReadSnapshot(l:path)
+  let l:hash = l:snapshot.hash
+  if l:kind ==# 'ATTRIB' && get(s:watch.signatures, l:path, '') ==# l:signature
         \ && get(s:watch.hashes, l:path, '') ==# l:hash
     return
   endif
   let l:before = get(s:watch.contents, l:path, [])
-  let l:after = s:ReadContents(l:path)
+  let l:after = l:snapshot.contents
   let s:watch.signatures[l:path] = l:signature
   let s:watch.hashes[l:path] = l:hash
+  if !has_key(s:watch, 'baseline')
+    let s:watch.baseline = {}
+  endif
+  if !has_key(s:watch.baseline, l:path)
+    let s:watch.baseline[l:path] = {'hash': get(s:watch.hashes, l:path, ''), 'size': getfsize(l:path)}
+  endif
+  if !has_key(s:watch, 'diffs')
+    let s:watch.diffs = {}
+  endif
+  let s:watch.diffs[l:path] = s:BuildDiff(l:before, l:after)
   call s:StoreSnapshot(l:path, l:after)
   let s:changed_path = l:path
   let s:selected_path = l:path
@@ -763,26 +896,18 @@ function! s:WatchEvent(channel, message) abort
   try
     let s:watch_buffer .= a:message
     while !empty(s:watch_buffer)
-      if s:watch_buffer[0] ==# 'E'
-        let l:newline = stridx(s:watch_buffer, "\n")
-        if l:newline < 0
-          break
-        endif
-        call s:TreeError('watcher ' . strpart(s:watch_buffer, 1, l:newline - 1))
-        let s:watch_buffer = strpart(s:watch_buffer, l:newline + 1)
-        let g:vide_watch_backend = 'OFF'
-        continue
-      endif
       if s:watch_buffer[0] !=# 'P'
         let s:watch_buffer = strpart(s:watch_buffer, 1)
         continue
       endif
       let l:separator = stridx(s:watch_buffer, ':')
-      if l:separator < 2
+      if l:separator < 3
         break
       endif
-      let l:length_text = strpart(s:watch_buffer, 1, l:separator - 1)
-      if l:length_text !~# '^\d\+$'
+      let l:header = strpart(s:watch_buffer, 1, l:separator - 1)
+      let l:kind = matchstr(l:header, '^[A-Z_]*')
+      let l:length_text = strpart(l:header, strlen(l:kind))
+      if empty(l:kind) || l:length_text !~# '^\d\+$'
         let s:watch_buffer = ''
         break
       endif
@@ -793,10 +918,16 @@ function! s:WatchEvent(channel, message) abort
       endif
       let l:path = strpart(s:watch_buffer, l:payload_at, l:length)
       let s:watch_buffer = strpart(s:watch_buffer, l:payload_at + l:length)
+      if l:kind ==# 'ERROR'
+        let s:watch_error = 1
+        let g:vide_watch_backend = 'OFF'
+        call s:TreeError('watcher ' . l:path)
+        continue
+      endif
       if s:initializing
-        call add(s:pending_events, l:path)
+        call add(s:pending_events, [l:kind, l:path])
       else
-        call s:HandleChangedPath(l:path)
+        call s:HandleChangedPath(l:path, l:kind)
       endif
     endwhile
   finally
@@ -806,7 +937,11 @@ endfunction
 
 function! s:WatchError(channel, message) abort
   if !empty(a:message)
-    call s:TreeError(substitute(a:message, '\n\+$', '', ''))
+    let s:watch_error = 1
+    let g:vide_watch_backend = 'OFF'
+    if empty(get(g:, 'vide_notice', '')) || get(g:, 'vide_notice', '') !~# '^ERROR:'
+      call s:TreeError(substitute(a:message, '\n\+$', '', ''))
+    endif
   endif
 endfunction
 
@@ -822,12 +957,15 @@ function! s:WatchExit(job, status) abort
   let s:watch_job = 0
   if !s:watcher_stopping
     let g:vide_watch_backend = 'OFF'
-    call s:TreeError('watcher stopped; automatic tracking is off')
+    if !s:watch_error
+      call s:TreeError('watcher stopped; automatic tracking is off')
+    endif
   endif
 endfunction
 
 function! s:StartWatcher() abort
   let s:watcher_stopping = 0
+  let s:watch_error = 0
   let s:watch_buffer = ''
   if !exists('*job_start') || !executable(s:watcher_path)
     let g:vide_watch_backend = 'OFF'
@@ -864,8 +1002,8 @@ endfunction
 function! s:DrainPendingEvents() abort
   let l:events = s:pending_events
   let s:pending_events = []
-  for l:path in l:events
-    call s:HandleChangedPath(l:path)
+  for l:event in l:events
+    call s:HandleChangedPath(l:event[1], l:event[0])
   endfor
 endfunction
 
@@ -877,8 +1015,12 @@ function! s:CloseSettings() abort
 endfunction
 
 function! s:ApplySetting(index, value) abort
-  if a:value !~# '^\d\+$'
+  if a:index != 4 && a:value !~# '^\d\+$'
     call s:TreeError('enter a whole number')
+    return
+  endif
+  if a:index == 4 && index(['auto', 'unicode', 'ascii'], tolower(trim(a:value))) < 0
+    call s:TreeError('marker style must be auto, unicode, or ascii')
     return
   endif
   if a:index == 1
@@ -887,6 +1029,8 @@ function! s:ApplySetting(index, value) abort
     let s:settings.content_limit_kb = str2nr(a:value)
   elseif a:index == 3
     let s:settings.snapshot_budget_kb = str2nr(a:value)
+  elseif a:index == 4
+    let s:settings.marker_style = tolower(trim(a:value))
   endif
   call s:ValidateSettings()
   call s:SaveSettings()
@@ -895,7 +1039,7 @@ function! s:ApplySetting(index, value) abort
 endfunction
 
 function! s:EditSetting(index) abort
-  if a:index < 1 || a:index > 3
+  if a:index < 1 || a:index > 4
     return
   endif
   call s:CloseSettings()
@@ -903,8 +1047,10 @@ function! s:EditSetting(index) abort
     let l:value = input('Sidebar width (20-60%) [' . s:settings.sidebar_percent . ']: ')
   elseif a:index == 2
     let l:value = input('Per-file snapshot limit (64-4096 KB) [' . s:settings.content_limit_kb . ']: ')
-  else
+  elseif a:index == 3
     let l:value = input('Snapshot budget (1024-65536 KB) [' . s:settings.snapshot_budget_kb . ']: ')
+  else
+    let l:value = input('Marker style (auto/unicode/ascii) [' . s:settings.marker_style . ']: ')
   endif
   if !empty(l:value)
     call s:ApplySetting(a:index, l:value)
@@ -924,8 +1070,8 @@ function! s:OpenSettings() abort
     return
   endif
   if !exists('*popup_create') || &lines < 12 || &columns < 45
-    let l:choice = inputlist(['VIDE SETTINGS', '1. Sidebar width: ' . s:settings.sidebar_percent . '%', '2. Per-file snapshot: ' . s:settings.content_limit_kb . ' KB', '3. Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB'])
-    if l:choice >= 1 && l:choice <= 3
+    let l:choice = inputlist(['VIDE SETTINGS', '1. Sidebar width: ' . s:settings.sidebar_percent . '%', '2. Per-file snapshot: ' . s:settings.content_limit_kb . ' KB', '3. Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB', '4. Marker style: ' . s:settings.marker_style])
+    if l:choice >= 1 && l:choice <= 4
       let l:value = input('New value: ')
       if !empty(l:value)
         call s:ApplySetting(l:choice, l:value)
@@ -938,7 +1084,8 @@ function! s:OpenSettings() abort
   let l:items = [
         \ 'Sidebar width: ' . s:settings.sidebar_percent . '%',
         \ 'Per-file snapshot: ' . s:settings.content_limit_kb . ' KB',
-        \ 'Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB']
+        \ 'Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB',
+        \ 'Marker style: ' . s:settings.marker_style]
   let s:settings_popup = popup_menu(l:items, {
         \ 'pos': 'center', 'minwidth': l:width, 'maxwidth': l:width,
         \ 'padding': [1, 2, 1, 2], 'border': [1, 1, 1, 1],
@@ -986,7 +1133,7 @@ endfunction
 
 function! s:StyleEditorWindow() abort
   if win_id2win(s:editor_win) > 0
-    call win_execute(s:editor_win, 'setlocal winhighlight=StatusLine:VideStatusLine,StatusLineNC:VideStatusLineNC,VertSplit:VideDivider')
+    call win_execute(s:editor_win, 'setlocal nowrap sidescroll=1 winhighlight=StatusLine:VideStatusLine,StatusLineNC:VideStatusLineNC,VertSplit:VideDivider')
   endif
 endfunction
 
@@ -1045,6 +1192,7 @@ function! s:Start() abort
     return
   endif
   let s:editor_win = win_getid()
+  call s:LoadIgnorePatterns()
   topleft vertical new
   let s:tree_win = win_getid()
   let s:tree_buf = bufnr('%')
@@ -1076,16 +1224,28 @@ inoremap <silent> <C-C> <C-O>:call <SID>Interrupt()<CR>
 cnoremap <silent> <C-C> <C-U>call <SID>Interrupt()<CR>
 tnoremap <silent> <C-C> <C-\\><C-N>:call <SID>Interrupt()<CR>
 
+let g:vide_runtime_dispatch = {
+      \ 'start': function('<SID>Start'),
+      \ 'stop': function('<SID>StopWatcher'),
+      \ 'render': function('<SID>Render'),
+      \ 'activate': function('<SID>Activate'),
+      \ 'restart_watch': function('<SID>RestartWatcher'),
+      \ 'snapshot_stats': function('<SID>SnapshotStats'),
+      \ 'fs_call': function('<SID>FsCall'),
+      \ 'open_settings': function('<SID>OpenSettings'),
+      \ 'resize': function('<SID>ResizeSidebar'),
+      \ 'should_ignore': function('<SID>ShouldIgnore')}
+
 call s:LoadSettings()
 
 augroup vide_runtime
   autocmd!
-  autocmd VimEnter * call <SID>Start()
-  autocmd VimResized * call <SID>Start() | call <SID>ResizeSidebar()
+  autocmd VimEnter * call vide#core#start()
+  autocmd VimResized * call vide#core#start() | call vide#ui#resize()
   autocmd BufReadPost * call <SID>RememberPath(expand('<afile>:p'))
   autocmd BufWritePost * call <SID>RememberPath(expand('<afile>:p'))
   autocmd WinClosed * call <SID>MaybeExitAfterEditorClose()
-  autocmd VimLeavePre * call <SID>StopWatcher()
+  autocmd VimLeavePre * call vide#core#stop()
   autocmd VimLeavePre * if s:interrupt_timer > 0 | call timer_stop(s:interrupt_timer) | endif
 augroup END
 

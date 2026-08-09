@@ -15,10 +15,17 @@ The launcher works when invoked from bash or zsh.  A locally built
 `vim-master/src/vim` is preferred; otherwise it uses `vim` from `PATH`. Set
 `VIDE_VIM` to use a different Vim executable.
 
-To build the bundled Vim implementation and Linux event watcher, run
-`make vim watch`. Building Vim requires the ncurses development package (for
+To build the bundled Vim implementation, Linux event watcher, and secure file
+helper, run `make all`. Building Vim requires the ncurses development package (for
 example `ncurses-devel` on Fedora). VIDE uses kernel events and never performs
 periodic directory scans.
+
+For a complete installation, deploy the launcher and both helpers together:
+`bin/vide`, `bin/vide-watch`, `bin/vide-fs`, and `src/vide.vim`. The helper
+binaries are native to the build host; rebuild them on each target platform
+instead of copying architecture-specific ELF files.
+Windows installations additionally use `bin/vide.bat` and the corresponding
+`.exe` helpers.
 
 ## Explorer controls
 
@@ -53,10 +60,21 @@ in the tree, opened in Vim, and moved to its first changed line when a prior
 readable version is available. If the active editor has unsaved work, vide
 preserves it and opens the changed file in an additional split in the Vim area.
 
+Directories named `.git`, `node_modules`, and `__pycache__` are ignored by
+default. Add a `.videignore` file at the project root to add shell-style
+patterns (one per line; blank lines and `#` comments are ignored). The public
+module facades are available as `vide#core#...`, `vide#tree#...`,
+`vide#watch#...`, `vide#fs#...`, `vide#settings#...`, and `vide#ui#...`.
+
 On Linux, `make watch` builds `bin/vide-watch`, which reports writes, creates,
 moves, and deletes directly from the kernel. The active backend is shown as
 `LIVE` in the explorer status line. If the helper is unavailable or exits,
 VIDE shows `OFF` and does not silently start a polling fallback.
+
+The Linux build uses inotify; macOS/FreeBSD builds select the kqueue backend
+source, and Windows builds select the native helper sources. Remote projects
+can be bridged with `bin/vide-ssh-proxy` by setting `REMOTE_HOST`,
+`REMOTE_DIR`, and `LOCAL_MOUNT`.
 
 
 Project layout: `bin/` contains the launcher and compiled watcher, `src/`
