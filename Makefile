@@ -56,6 +56,8 @@ test: $(WATCHER) $(FS_HELPER)
 	VIMRUNTIME=$(CURDIR)/vim-master/runtime $(VIM_BIN) -Nu NONE -n -i NONE -es -S tests/test_modules.vim
 	VIMRUNTIME=$(CURDIR)/vim-master/runtime $(VIM_BIN) -Nu NONE -n -i NONE -es -S tests/test_ignore.vim
 	VIMRUNTIME=$(CURDIR)/vim-master/runtime $(VIM_BIN) -Nu NONE -n -i NONE -es -S tests/test_snapshot_budget.vim
+	VIMRUNTIME=$(CURDIR)/vim-master/runtime $(VIM_BIN) -Nu NONE -n -i NONE -es -S tests/test_perf_fixes.vim
+	VIMRUNTIME=$(CURDIR)/vim-master/runtime $(VIM_BIN) -Nu NONE -n -i NONE -es -S tests/test_perf_fixes_settings.vim
 
 lint:
 	@! rg -n 'WatchTick|poll_ms|inotifywait' src lib bin tests

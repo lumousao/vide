@@ -3,7 +3,18 @@
 # where zsh is common too, so this remains usable from either shell.
 set -euo pipefail
 
-vide_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+# Resolve symlinks so `vide` keeps working when it is installed via a symlink
+# such as ~/.local/bin/vide -> <project>/bin/vide.  BASH_SOURCE[0] would
+# otherwise point at the link and the project directory would resolve wrong.
+source_path="${BASH_SOURCE[0]}"
+while [ -L "$source_path" ]; do
+  link_target="$(readlink "$source_path")"
+  case "$link_target" in
+    /*) source_path="$link_target" ;;
+    *)  source_path="$(cd "$(dirname "$source_path")" && pwd)/$link_target" ;;
+  esac
+done
+vide_dir="$(cd "$(dirname "$source_path")/.." && pwd -P)"
 if [[ -z "${VIDE_VIM:-}" && -x "$vide_dir/vim-master/src/vim" ]]; then
     vim_bin="$vide_dir/vim-master/src/vim"
     export VIMRUNTIME="$vide_dir/vim-master/runtime"

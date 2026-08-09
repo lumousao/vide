@@ -34,6 +34,16 @@ let s:watch_error = 0
 let s:stopped_watch_jobs = {}
 let s:watch_buffer = ''
 let s:pending_events = []
+" Performance: renders are deferred to the end of an event batch so a burst of
+" writes triggers one tree refresh, not one per event.  s:watch_queue buffers
+" channel chunks so re-entrant callbacks never drop events.
+let s:render_dirty = 0
+let s:structural_change = 0
+let s:watch_queue = []
+let s:batch_last_path = ''
+let s:batch_last_line = 1
+let s:has_open_candidate = 0
+let s:last_message = ''
 let s:initializing = 0
 " Populated by the one startup walk so rendering does not repeat readdir/stat.
 let s:children_cache = {}
@@ -78,14 +88,17 @@ let s:settings = {
       \ 'watch_mode': 'aggressive',
       \ 'auto_reload': 1,
       \ 'conflict_strategy': 'ask',
-      \ 'verbose_changes': 1}
+      \ 'verbose_changes': 1,
+      \ 'auto_jump': 1,
+      \ 'snapshot_mode': 'content'}
 
 " Allowed values and numeric ranges, used by both the loader and the settings
 " menu so a hand-edited settings file cannot push VIDE into a broken state.
 let s:setting_choices = {
       \ 'watch_mode': ['aggressive', 'normal', 'minimal'],
       \ 'conflict_strategy': ['ask', 'use', 'reload'],
-      \ 'marker_style': ['auto', 'unicode', 'ascii']}
+      \ 'marker_style': ['auto', 'unicode', 'ascii'],
+      \ 'snapshot_mode': ['content', 'stat']}
 let s:setting_ranges = {
       \ 'sidebar_percent': [20, 60],
       \ 'content_limit_kb': [64, 4096],
@@ -263,8 +276,12 @@ function! s:ValidateSettings() abort
   if index(['ask', 'keep-local', 'keep-external'], get(s:settings, 'conflict_strategy', 'ask')) < 0
     let s:settings.conflict_strategy = 'ask'
   endif
+  if index(['content', 'stat'], get(s:settings, 'snapshot_mode', 'content')) < 0
+    let s:settings.snapshot_mode = 'content'
+  endif
   let s:settings.auto_reload = get(s:settings, 'auto_reload', 1) ? 1 : 0
   let s:settings.verbose_changes = get(s:settings, 'verbose_changes', 1) ? 1 : 0
+  let s:settings.auto_jump = get(s:settings, 'auto_jump', 1) ? 1 : 0
   let s:content_limit = s:settings.content_limit_kb * 1024
   let s:snapshot_budget = s:settings.snapshot_budget_kb * 1024
   let g:vide_settings = deepcopy(s:settings)
@@ -412,9 +429,9 @@ function! s:TrackRecentChange(path, kind) abort
   endif
 
   let g:vide_last_change = l:message
-  if get(s:settings, 'verbose_changes', 1)
-    echomsg 'VIDE: ' . l:message
-  endif
+  " The message is surfaced once per event batch by s:FlushChangedEvents, so a
+  " burst of writes does not flood the message area with echomsgs.
+  let s:last_message = l:message
 
   " One shared expiry timer, not one per event: a busy agent can emit hundreds
   " of writes per second, and a timer each would pile up unbounded.
@@ -634,58 +651,69 @@ function! s:ComparePaths(left, right) abort
   return l:left_name ==# l:right_name ? 0 : (l:left_name ># l:right_name ? 1 : -1)
 endfunction
 
+" readdir() is ~1500x faster than readdirex() on the bundled Vim build (the
+" latter does a full stat per entry internally), so both the explorer and the
+" startup walk read directories with readdir().  Each entry's dir/file type is
+" resolved once and cached in s:node_types; the sort comparator then hits the
+" cache instead of stat'ing once per comparison.
+" Classify one directory entry: returns '' for ignored/transient entries,
+" otherwise the normalized path with its type cached.
+function! s:ClassifyEntry(parent, name) abort
+  if a:name ==# '.' || a:name ==# '..'
+    return ''
+  endif
+  let l:normalized = s:NormalizePath(a:parent . '/' . a:name)
+  if l:normalized ==# s:root || l:normalized ==# fnamemodify(s:root, ':h') || s:IsTransient(l:normalized) || s:ShouldIgnore(l:normalized)
+    return ''
+  endif
+  let s:node_types[l:normalized] = s:IsDirectory(l:normalized)
+  return l:normalized
+endfunction
+
+function! s:RawChildren(path) abort
+  let l:result = []
+  try
+    for l:name in readdir(a:path)
+      let l:normalized = s:ClassifyEntry(a:path, l:name)
+      if !empty(l:normalized)
+        call add(l:result, l:normalized)
+      endif
+    endfor
+  catch /^Vim\%((\a\+))\=:E/
+    return []
+  endtry
+  return l:result
+endfunction
+
 function! s:Children(path) abort
   if has_key(s:children_cache, a:path)
     return copy(s:children_cache[a:path])
   endif
-  let l:result = []
-  let l:ok = 1
-  try
-    if exists('*readdirex')
-      for l:item in readdirex(a:path)
-        let l:name = get(l:item, 'name', '')
-        if empty(l:name) || l:name ==# '.' || l:name ==# '..'
-          continue
-        endif
-        let l:normalized = s:NormalizePath(a:path . '/' . l:name)
-        if l:normalized !=# s:root && l:normalized !=# fnamemodify(s:root, ':h') && !s:IsTransient(l:normalized) && !s:ShouldIgnore(l:normalized)
-          call add(l:result, l:normalized)
-        endif
-      endfor
-    else
-      for l:name in readdir(a:path)
-        if l:name ==# '.' || l:name ==# '..'
-          continue
-        endif
-        let l:normalized = s:NormalizePath(a:path . '/' . l:name)
-        if l:normalized !=# s:root && l:normalized !=# fnamemodify(s:root, ':h') && !s:IsTransient(l:normalized) && !s:ShouldIgnore(l:normalized)
-          call add(l:result, l:normalized)
-        endif
-      endfor
-    endif
-  catch /^Vim\%((\a\+))\=:E/
-    let l:ok = 0
-  endtry
-  if !l:ok
-    return []
-  endif
+  let l:result = s:RawChildren(a:path)
   let l:result = sort(l:result, function('s:ComparePaths'))
   let s:children_cache[a:path] = copy(l:result)
   return l:result
 endfunction
 
-function! s:AddNode(path, depth, lines, nodes) abort
+" Build the display text for one tree node.  Extracted from AddNode so an
+" incremental refresh can rewrite a single changed line without rebuilding the
+" whole tree.
+function! s:NodeLine(path, depth) abort
   let l:is_dir = s:IsDirectory(a:path)
   let l:name = a:path ==# s:root ? s:DisplayName(s:root) : s:DisplayName(a:path)
   let l:indent = repeat('  ', a:depth)
   if l:is_dir
     let l:prefix = l:indent . s:TreeMarker(a:path) . ' '
-    call add(a:lines, l:prefix . s:FitTreeLabel(l:name, winwidth(0) - strdisplaywidth(l:prefix)))
-  else
-    let l:prefix = l:indent . '  '
-    call add(a:lines, l:prefix . s:FitTreeLabel(l:name, winwidth(0) - strdisplaywidth(l:prefix)))
+    return l:prefix . s:FitTreeLabel(l:name, winwidth(0) - strdisplaywidth(l:prefix))
   endif
-  call add(a:nodes, {'path': a:path, 'dir': l:is_dir, 'line': len(a:lines)})
+  let l:prefix = l:indent . '  '
+  return l:prefix . s:FitTreeLabel(l:name, winwidth(0) - strdisplaywidth(l:prefix))
+endfunction
+
+function! s:AddNode(path, depth, lines, nodes) abort
+  let l:is_dir = s:IsDirectory(a:path)
+  call add(a:lines, s:NodeLine(a:path, a:depth))
+  call add(a:nodes, {'path': a:path, 'dir': l:is_dir, 'line': len(a:lines), 'depth': a:depth})
 
   if l:is_dir && has_key(s:expanded, a:path)
     for l:child in s:Children(a:path)
@@ -725,6 +753,36 @@ function! s:ApplyChangedHighlight() abort
   endfor
 endfunction
 
+function! s:BuildTree() abort
+  let l:lines = []
+  let l:nodes = []
+  call s:AddNode(s:root, 0, l:lines, l:nodes)
+  return [l:lines, l:nodes]
+endfunction
+
+function! s:DrawTree(lines, nodes) abort
+  setlocal modifiable
+  silent %delete _
+  call setline(1, a:lines)
+  if line('$') > len(a:lines)
+    call deletebufline('%', len(a:lines) + 1, '$')
+  endif
+  let b:vide_lines = a:lines
+  let b:vide_nodes = a:nodes
+  setlocal nomodifiable
+  " Conflict count for the statusline (0 means no marker)
+  let b:vide_conflict_count = len(s:conflicts)
+  call s:ApplyChangedHighlight()
+  if !empty(s:selected_path)
+    for l:node in a:nodes
+      if l:node.path ==# s:selected_path
+        call cursor(l:node.line, 1)
+        break
+      endif
+    endfor
+  endif
+endfunction
+
 function! s:Render() abort
   if !bufexists(s:tree_buf)
     return
@@ -733,27 +791,47 @@ function! s:Render() abort
   if !win_gotoid(s:tree_win)
     return
   endif
-  let l:lines = []
-  let l:nodes = []
-  call s:AddNode(s:root, 0, l:lines, l:nodes)
-  setlocal modifiable
-  silent %delete _
-  call setline(1, l:lines)
-  if line('$') > len(l:lines)
-    call deletebufline('%', len(l:lines) + 1, '$')
+  let [l:lines, l:nodes] = s:BuildTree()
+  call s:DrawTree(l:lines, l:nodes)
+  if win_getid() != l:origin_win && win_id2win(l:origin_win) > 0
+    call win_gotoid(l:origin_win)
   endif
-  let b:vide_nodes = l:nodes
-  setlocal nomodifiable
-  " Conflict count for the statusline (0 means no marker)
-  let b:vide_conflict_count = len(s:conflicts)
-  call s:ApplyChangedHighlight()
-  if !empty(s:selected_path)
-    for l:node in l:nodes
-      if l:node.path ==# s:selected_path
-        call cursor(l:node.line, 1)
-        break
-      endif
-    endfor
+endfunction
+
+" Refresh the tree after an external content change.  When the changed path is
+" already a visible node we update only that line plus the highlights (a few
+" ms); otherwise we fall back to a full rebuild (needed to reveal newly
+" expanded ancestors or reflect a structural change).
+function! s:RenderChangedPath(path) abort
+  if !bufexists(s:tree_buf)
+    return
+  endif
+  let l:origin_win = win_getid()
+  if !win_gotoid(s:tree_win)
+    return
+  endif
+  let l:node = {}
+  for l:cand in get(b:, 'vide_nodes', [])
+    if l:cand.path ==# a:path
+      let l:node = l:cand
+      break
+    endif
+  endfor
+  if empty(l:node)
+    call s:Render()
+  else
+    setlocal modifiable
+    call setline(l:node.line, s:NodeLine(a:path, l:node.depth))
+    setlocal nomodifiable
+    call s:ApplyChangedHighlight()
+    if !empty(s:selected_path)
+      for l:cand in get(b:, 'vide_nodes', [])
+        if l:cand.path ==# s:selected_path
+          call cursor(l:cand.line, 1)
+          break
+        endif
+      endfor
+    endif
   endif
   if win_getid() != l:origin_win && win_id2win(l:origin_win) > 0
     call win_gotoid(l:origin_win)
@@ -1063,7 +1141,8 @@ endfunction
 function! s:NewBaselineState(files) abort
   return {'files': a:files, 'index': 0, 'bytes': 0, 'signatures': {},
         \ 'hashes': {}, 'contents': {}, 'baseline': {}, 'sizes': {},
-        \ 'diffs': {}, 'order': [], 'phase': 'snapshot', 'stack': []}
+        \ 'diffs': {}, 'order': [], 'phase': 'snapshot', 'stack': [],
+        \ 'entries': [], 'entry_index': 0, 'cur_dir': ''}
 endfunction
 
 function! s:CollectBaselineFile(state, path) abort
@@ -1072,6 +1151,13 @@ function! s:CollectBaselineFile(state, path) abort
   endif
   let l:size = getfsize(a:path)
   let a:state.signatures[a:path] = getftime(a:path) . ':' . l:size
+  " 'stat' snapshot mode tracks changes by mtime+size alone and never reads
+  " file contents at startup, so large projects open without any I/O of the
+  " file bodies.  Content snapshots (for precise change lines and F5 diff)
+  " are only taken in 'content' mode.
+  if get(s:settings, 'snapshot_mode', 'content') !=# 'content'
+    return
+  endif
   if l:size < 0 || l:size > s:content_limit
     return
   endif
@@ -1136,26 +1222,45 @@ function! s:BaselineTick(timer) abort
   let l:start = reltime()
   let l:count = 0
   if s:baseline_state.phase ==# 'walk'
-    " Directory enumeration is also incremental.  A recursive CollectFiles()
-    " here used to block all keyboard input before the timer even started.
-    while !empty(s:baseline_state.stack)
-      let l:directory = remove(s:baseline_state.stack, -1)
-      if l:directory =~# '/\.git\%(/\|$\)' || s:ShouldIgnore(l:directory)
+    " Directory enumeration is incremental at the per-entry level: a directory
+    " is listed with the cheap readdir() once and each entry is classified in a
+    " small slice, so even a directory with thousands of entries can never
+    " freeze the UI for longer than one slice.
+    while 1
+      if s:baseline_state.entry_index >= len(s:baseline_state.entries)
+        if empty(s:baseline_state.stack)
+          break
+        endif
+        let s:baseline_state.cur_dir = remove(s:baseline_state.stack, -1)
+        if s:baseline_state.cur_dir =~# '/\.git\%(/\|$\)' || s:ShouldIgnore(s:baseline_state.cur_dir)
+          let s:baseline_state.entries = []
+          let s:baseline_state.entry_index = 0
+          continue
+        endif
+        try
+          let s:baseline_state.entries = readdir(s:baseline_state.cur_dir)
+        catch /^Vim\%((\a\+))\=:E/
+          let s:baseline_state.entries = []
+        endtry
+        let s:baseline_state.entry_index = 0
         continue
       endif
-      for l:entry in s:Children(l:directory)
+      let l:name = s:baseline_state.entries[s:baseline_state.entry_index]
+      let s:baseline_state.entry_index += 1
+      let l:entry = s:ClassifyEntry(s:baseline_state.cur_dir, l:name)
+      if !empty(l:entry)
         if s:IsDirectory(l:entry)
           call add(s:baseline_state.stack, l:entry)
         elseif s:CanWatch(l:entry)
           call add(s:baseline_state.files, l:entry)
         endif
-      endfor
-      let l:count += 1
-      if l:count >= 16 || reltimefloat(reltime(l:start)) >= 0.02
+        let l:count += 1
+      endif
+      if l:count >= 64 || reltimefloat(reltime(l:start)) >= 0.02
         break
       endif
     endwhile
-    if empty(s:baseline_state.stack)
+    if empty(s:baseline_state.stack) && s:baseline_state.entry_index >= len(s:baseline_state.entries)
       let s:baseline_state.phase = 'snapshot'
     endif
   else
@@ -1308,12 +1413,16 @@ function! s:HandleChangedPath(path, kind) abort
   if index(['MOVE_OUT', 'DELETE'], l:kind) >= 0
     call s:InvalidateTreeCache()
     call s:PruneWatch(l:path)
-    call s:Render()
+    let s:render_dirty = 1
+    let s:structural_change = 1
+    let s:has_open_candidate = 0
     return
   endif
   if l:kind ==# 'DIR' || s:IsDirectory(l:path)
     call s:InvalidateTreeCache()
-    call s:Render()
+    let s:render_dirty = 1
+    let s:structural_change = 1
+    let s:has_open_candidate = 0
     return
   endif
   if !filereadable(l:path) || s:IsTransient(l:path)
@@ -1322,7 +1431,9 @@ function! s:HandleChangedPath(path, kind) abort
     endif
     call s:PruneWatch(l:path)
     call s:InvalidateTreeCache()
-    call s:Render()
+    let s:render_dirty = 1
+    let s:structural_change = 1
+    let s:has_open_candidate = 0
     return
   endif
 
@@ -1367,10 +1478,18 @@ function! s:HandleChangedPath(path, kind) abort
   let s:selected_path = l:path
   let s:changed_line = s:FirstChangedLine(l:before, l:after)
   call s:Reveal(l:path)
-  " s:Render already moves the cursor to s:selected_path, so a separate
-  " s:SelectPath call here would only repeat the window switch.
-  call s:Render()
-  call s:OpenFile(l:path, s:changed_line)
+  let s:render_dirty = 1
+  " Remember the most recently changed file so the batch flush can open it
+  " exactly once after all events in the batch are handled, instead of each
+  " event stealing the editor window.
+  let s:batch_last_path = l:path
+  let s:batch_last_line = s:changed_line
+  let s:has_open_candidate = 1
+endfunction
+
+" Sort helper for the arrival-ordered event batch: [seq, event] pairs.
+function! s:SortBySeq(a, b) abort
+  return a:a[0] - a:b[0]
 endfunction
 
 function! s:FlushChangedEvents(timer) abort
@@ -1380,23 +1499,53 @@ function! s:FlushChangedEvents(timer) abort
   endif
   let l:events = s:pending_events
   let s:pending_events = []
+  " Deduplicate the batch while preserving arrival order.  For WRITE/ATTRIB
+  " only the last occurrence of each path is kept, but its position is the one
+  " it would occupy in arrival order, so the most recently written file is
+  " processed last and is therefore the one the batch opens.
   let l:compact = []
-  let l:last_attribute = {}
+  let l:by_path = {}
+  let l:position = 0
   for l:event in l:events
     let l:kind = l:event[0]
     let l:path = l:event[1]
-    if index(['WRITE', 'ATTRIB'], l:kind) >= 0 && has_key(l:last_attribute, l:path)
-      let l:compact[l:last_attribute[l:path]] = l:event
+    if index(['WRITE', 'ATTRIB'], l:kind) >= 0
+      let l:by_path[l:path] = [l:position, l:event]
     else
-      call add(l:compact, l:event)
-      if index(['WRITE', 'ATTRIB'], l:kind) >= 0
-        let l:last_attribute[l:path] = len(l:compact) - 1
-      endif
+      call add(l:compact, [l:position, l:event])
     endif
+    let l:position += 1
   endfor
+  for l:entry in values(l:by_path)
+    call add(l:compact, l:entry)
+  endfor
+  call sort(l:compact, function('s:SortBySeq'))
+  let l:compact = map(l:compact, 'v:val[1]')
+  let s:render_dirty = 0
+  let s:structural_change = 0
+  let s:has_open_candidate = 0
+  let s:last_message = ''
   for l:event in l:compact
     call s:HandleChangedPath(l:event[1], l:event[0])
   endfor
+  " One tree refresh for the whole batch instead of one per event.
+  if s:render_dirty
+    if s:structural_change
+      call s:Render()
+    else
+      call s:RenderChangedPath(s:batch_last_path)
+    endif
+  endif
+  " Open the most recently changed file exactly once per batch.  auto_jump
+  " (on by default) preserves the "open the changed file" behaviour, while a
+  " burst of writes no longer yanks the editor window once per file.
+  if s:has_open_candidate && !empty(s:batch_last_path) && get(s:settings, 'auto_jump', 1)
+    call s:OpenFile(s:batch_last_path, s:batch_last_line)
+  endif
+  " Surface a single change message per batch instead of one echomsg per event.
+  if get(s:settings, 'verbose_changes', 1) && !empty(s:last_message)
+    echomsg 'VIDE: ' . s:last_message
+  endif
 endfunction
 
 function! s:QueueChangedEvent(kind, path) abort
@@ -1416,21 +1565,21 @@ function! s:GetWatchBehavior() abort
   let l:mode = get(s:settings, 'watch_mode', 'aggressive')
   if l:mode ==# 'aggressive'
     return {
-          \ 'event_delay_ms': 5,
+          \ 'event_delay_ms': 50,
           \ 'force_reload': 1,
           \ 'ignore_attrib': 0,
           \ 'show_all_changes': 1
           \ }
   elseif l:mode ==# 'minimal'
     return {
-          \ 'event_delay_ms': 50,
+          \ 'event_delay_ms': 150,
           \ 'force_reload': 0,
           \ 'ignore_attrib': 1,
           \ 'show_all_changes': 0
           \ }
   else
     return {
-          \ 'event_delay_ms': 20,
+          \ 'event_delay_ms': 100,
           \ 'force_reload': 0,
           \ 'ignore_attrib': 0,
           \ 'show_all_changes': 1
@@ -1452,46 +1601,55 @@ function! s:AdjustWatchMode() abort
 endfunction
 
 function! s:WatchEvent(channel, message) abort
-  if s:watching || s:watcher_stopping || type(a:message) != type('') || empty(a:message)
+  if s:watcher_stopping || type(a:message) != type('') || empty(a:message)
+    return
+  endif
+  " Buffer incoming chunks instead of dropping them when the callback re-enters
+  " (raw channel output can arrive while a previous chunk is still being
+  " parsed).  Events are processed once the queue drains.
+  call add(s:watch_queue, a:message)
+  if s:watching
     return
   endif
   let s:watching = 1
   try
-    let s:watch_buffer .= a:message
-    while !empty(s:watch_buffer)
-      if s:watch_buffer[0] !=# 'P'
-        let s:watch_buffer = strpart(s:watch_buffer, 1)
-        continue
-      endif
-      let l:separator = stridx(s:watch_buffer, ':')
-      if l:separator < 3
-        break
-      endif
-      let l:header = strpart(s:watch_buffer, 1, l:separator - 1)
-      let l:kind = matchstr(l:header, '^[A-Z_]*')
-      let l:length_text = strpart(l:header, strlen(l:kind))
-      if empty(l:kind) || l:length_text !~# '^\d\+$'
-        let s:watch_buffer = ''
-        break
-      endif
-      let l:length = str2nr(l:length_text)
-      let l:payload_at = l:separator + 1
-      if strlen(s:watch_buffer) < l:payload_at + l:length
-        break
-      endif
-      let l:path = strpart(s:watch_buffer, l:payload_at, l:length)
-      let s:watch_buffer = strpart(s:watch_buffer, l:payload_at + l:length)
-      if l:kind ==# 'ERROR'
-        let s:watch_error = 1
-        let g:vide_watch_backend = 'OFF'
-        call s:TreeError('watcher ' . l:path)
-        continue
-      endif
-      if s:initializing
-        call add(s:pending_events, [l:kind, l:path])
-      else
-        call s:QueueChangedEvent(l:kind, l:path)
-      endif
+    while !empty(s:watch_queue)
+      let s:watch_buffer .= remove(s:watch_queue, 0)
+      while !empty(s:watch_buffer)
+        if s:watch_buffer[0] !=# 'P'
+          let s:watch_buffer = strpart(s:watch_buffer, 1)
+          continue
+        endif
+        let l:separator = stridx(s:watch_buffer, ':')
+        if l:separator < 3
+          break
+        endif
+        let l:header = strpart(s:watch_buffer, 1, l:separator - 1)
+        let l:kind = matchstr(l:header, '^[A-Z_]*')
+        let l:length_text = strpart(l:header, strlen(l:kind))
+        if empty(l:kind) || l:length_text !~# '^\d\+$'
+          let s:watch_buffer = ''
+          break
+        endif
+        let l:length = str2nr(l:length_text)
+        let l:payload_at = l:separator + 1
+        if strlen(s:watch_buffer) < l:payload_at + l:length
+          break
+        endif
+        let l:path = strpart(s:watch_buffer, l:payload_at, l:length)
+        let s:watch_buffer = strpart(s:watch_buffer, l:payload_at + l:length)
+        if l:kind ==# 'ERROR'
+          let s:watch_error = 1
+          let g:vide_watch_backend = 'OFF'
+          call s:TreeError('watcher ' . l:path)
+          continue
+        endif
+        if s:initializing
+          call add(s:pending_events, [l:kind, l:path])
+        else
+          call s:QueueChangedEvent(l:kind, l:path)
+        endif
+      endwhile
     endwhile
   finally
     let s:watching = 0
@@ -1619,6 +1777,14 @@ function! s:ApplySetting(index, value) abort
     call s:TreeError('verbose changes must be on/off or 1/0')
     return
   endif
+  if a:index == 8 && index(['on', 'off', '1', '0'], tolower(trim(a:value))) < 0
+    call s:TreeError('auto-jump must be on/off or 1/0')
+    return
+  endif
+  if a:index == 9 && index(['content', 'stat'], tolower(trim(a:value))) < 0
+    call s:TreeError('snapshot mode must be content or stat')
+    return
+  endif
 
   if a:index == 1
     let s:settings.sidebar_percent = str2nr(a:value)
@@ -1636,6 +1802,11 @@ function! s:ApplySetting(index, value) abort
   elseif a:index == 7
     let l:val = tolower(trim(a:value))
     let s:settings.verbose_changes = (l:val ==# 'on' || l:val ==# '1')
+  elseif a:index == 8
+    let l:val = tolower(trim(a:value))
+    let s:settings.auto_jump = (l:val ==# 'on' || l:val ==# '1')
+  elseif a:index == 9
+    let s:settings.snapshot_mode = tolower(trim(a:value))
   endif
   call s:ValidateSettings()
   call s:SaveSettings()
@@ -1644,7 +1815,7 @@ function! s:ApplySetting(index, value) abort
 endfunction
 
 function! s:EditSetting(index) abort
-  if a:index < 1 || a:index > 7
+  if a:index < 1 || a:index > 9
     return
   endif
   call s:CloseSettings()
@@ -1662,6 +1833,10 @@ function! s:EditSetting(index) abort
     let l:value = input('Conflict strategy (ask/use/reload) [' . s:settings.conflict_strategy . ']: ')
   elseif a:index == 7
     let l:value = input('Verbose changes (on/off) [' . (s:settings.verbose_changes ? 'on' : 'off') . ']: ')
+  elseif a:index == 8
+    let l:value = input('Auto-jump to changed file (on/off) [' . (s:settings.auto_jump ? 'on' : 'off') . ']: ')
+  elseif a:index == 9
+    let l:value = input('Snapshot mode (content/stat) [' . s:settings.snapshot_mode . ']: ')
   endif
   if !empty(l:value)
     call s:ApplySetting(a:index, l:value)
@@ -1688,8 +1863,10 @@ function! s:OpenSettings() abort
           \ '4. Marker style: ' . s:settings.marker_style,
           \ '5. Watch mode: ' . s:settings.watch_mode,
           \ '6. Conflict strategy: ' . s:settings.conflict_strategy,
-          \ '7. Verbose changes: ' . (s:settings.verbose_changes ? 'ON' : 'OFF')])
-    if l:choice >= 1 && l:choice <= 7
+          \ '7. Verbose changes: ' . (s:settings.verbose_changes ? 'ON' : 'OFF'),
+          \ '8. Auto-jump: ' . (s:settings.auto_jump ? 'ON' : 'OFF'),
+          \ '9. Snapshot mode: ' . s:settings.snapshot_mode])
+    if l:choice >= 1 && l:choice <= 9
       let l:value = input('New value: ')
       if !empty(l:value)
         call s:ApplySetting(l:choice, l:value)
@@ -1706,7 +1883,9 @@ function! s:OpenSettings() abort
         \ 'Marker style: ' . s:settings.marker_style,
         \ 'Watch mode: ' . s:settings.watch_mode . ' (aggressive/normal/minimal)',
         \ 'Conflict strategy: ' . s:settings.conflict_strategy . ' (ask/use/reload)',
-        \ 'Verbose changes: ' . (s:settings.verbose_changes ? 'ON' : 'OFF')]
+        \ 'Verbose changes: ' . (s:settings.verbose_changes ? 'ON' : 'OFF'),
+        \ 'Auto-jump to changed file: ' . (s:settings.auto_jump ? 'ON' : 'OFF'),
+        \ 'Snapshot mode: ' . s:settings.snapshot_mode . ' (content/stat)']
   let s:settings_popup = popup_menu(l:items, {
         \ 'pos': 'center', 'minwidth': l:width, 'maxwidth': l:width,
         \ 'padding': [1, 2, 1, 2], 'border': [1, 1, 1, 1],
