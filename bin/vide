@@ -16,4 +16,12 @@ if ! command -v "$vim_bin" >/dev/null 2>&1; then
     exit 127
 fi
 
-exec "$vim_bin" -Nu "$vide_dir/src/vide.vim" -U NONE -N -i NONE "$@"
+vim_args=(-Nu "$vide_dir/src/vide.vim" -U NONE -N -i NONE)
+# Vim deliberately waits about two seconds when its full-screen UI is started
+# without a terminal (the built-in "Warning delay").  VIDE is often launched
+# through a wrapper or a test harness that redirects one of the standard
+# streams, so suppress that delay in the non-interactive case.
+if [[ ! -t 0 || ! -t 1 ]]; then
+    vim_args+=(--not-a-term)
+fi
+exec "$vim_bin" "${vim_args[@]}" "$@"

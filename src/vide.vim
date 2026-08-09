@@ -35,25 +35,89 @@ let s:stopped_watch_jobs = {}
 let s:watch_buffer = ''
 let s:pending_events = []
 let s:initializing = 0
+" Populated by the one startup walk so rendering does not repeat readdir/stat.
+let s:children_cache = {}
+let s:node_types = {}
+let s:baseline_timer = -1
+let s:baseline_state = {}
+let s:workspace_ready = 0
+let s:event_timer = -1
 let s:exe_suffix = has('win32') ? '.exe' : ''
 let s:watcher_path = get(g:, 'vide_watcher', expand('<sfile>:p:h:h') . '/bin/vide-watch' . s:exe_suffix)
 let s:fs_path = get(g:, 'vide_fs', expand('<sfile>:p:h:h') . '/bin/vide-fs' . s:exe_suffix)
 let s:notice = ''
 let s:ignore_patterns = ['^\.git\%(/\|$\)', '^node_modules\%(/\|$\)', '^__pycache__\%(/\|$\)']
 let g:vide_ignore_patterns = []
+
+" Enhanced conflict handling and change tracking
+let s:conflicts = {}
+let s:recent_changes = {}
+" Per-path change frequency, keyed by path: {'first': time, 'count': n, 'kinds': []}
+let s:change_stats = {}
+" Chronological change log, newest last, capped at s:change_log_limit entries
+let s:change_log = []
+let s:change_log_limit = 50
+let s:priority_paths = []
+let s:snapshot_priorities = {}
+let s:recent_timer = -1
+let g:vide_last_change = ''
+
 let g:vide_notice = ''
 let s:interrupt_armed = 0
 let s:interrupt_timer = -1
 let s:interrupt_popup = -1
 let s:settings_popup = -1
+
+" Settings with defaults.  Keep this as the single declaration: a second
+" 'let s:settings = {...}' would silently discard values loaded before it.
 let s:settings = {
       \ 'sidebar_percent': 34,
       \ 'content_limit_kb': 256,
       \ 'snapshot_budget_kb': 8192,
-      \ 'marker_style': 'auto'}
+      \ 'marker_style': 'auto',
+      \ 'watch_mode': 'aggressive',
+      \ 'auto_reload': 1,
+      \ 'conflict_strategy': 'ask',
+      \ 'verbose_changes': 1}
+
+" Allowed values and numeric ranges, used by both the loader and the settings
+" menu so a hand-edited settings file cannot push VIDE into a broken state.
+let s:setting_choices = {
+      \ 'watch_mode': ['aggressive', 'normal', 'minimal'],
+      \ 'conflict_strategy': ['ask', 'use', 'reload'],
+      \ 'marker_style': ['auto', 'unicode', 'ascii']}
+let s:setting_ranges = {
+      \ 'sidebar_percent': [20, 60],
+      \ 'content_limit_kb': [64, 4096],
+      \ 'snapshot_budget_kb': [1024, 65536]}
+
+function! s:ValidateSettings() abort
+  for [l:key, l:allowed] in items(s:setting_choices)
+    if index(l:allowed, get(s:settings, l:key, '')) < 0
+      let s:settings[l:key] = l:allowed[0]
+    endif
+  endfor
+  for [l:key, l:bounds] in items(s:setting_ranges)
+    let l:value = get(s:settings, l:key, l:bounds[0])
+    if type(l:value) != v:t_number
+      let l:value = str2nr(l:value)
+    endif
+    let s:settings[l:key] = min([l:bounds[1], max([l:bounds[0], l:value])])
+  endfor
+  for l:key in ['auto_reload', 'verbose_changes']
+    let s:settings[l:key] = empty(get(s:settings, l:key, 1)) ? 0 : 1
+  endfor
+  " Keep the snapshot limits in sync with the values actually used at runtime.
+  let s:content_limit = s:settings.content_limit_kb * 1024
+  let s:snapshot_budget = s:settings.snapshot_budget_kb * 1024
+endfunction
+
+call s:ValidateSettings()
 let g:vide_watch_backend = 'OFF'
 
 highlight default VideChanged cterm=bold ctermfg=Black ctermbg=DarkYellow gui=bold guifg=Black guibg=DarkYellow
+highlight default VideConflict cterm=bold ctermfg=Black ctermbg=Red gui=bold guifg=Black guibg=Red
+highlight default VideRecentChange cterm=bold ctermfg=Yellow gui=bold guifg=Yellow
 highlight default VideTreeRoot cterm=bold ctermfg=Cyan gui=bold guifg=Cyan
 highlight default VideTreeDirectory cterm=bold ctermfg=LightCyan gui=bold guifg=LightCyan
 highlight default VideTreeMarker cterm=bold ctermfg=Yellow gui=bold guifg=Yellow
@@ -116,7 +180,17 @@ function! s:Interrupt() abort
 endfunction
 
 function! s:IsDirectory(path) abort
-  return isdirectory(a:path) && getftype(a:path) !=# 'link'
+  if has_key(s:node_types, a:path)
+    return s:node_types[a:path]
+  endif
+  let l:result = isdirectory(a:path) && getftype(a:path) !=# 'link'
+  let s:node_types[a:path] = l:result
+  return l:result
+endfunction
+
+function! s:InvalidateTreeCache() abort
+  let s:children_cache = {}
+  let s:node_types = {}
 endfunction
 
 function! s:NormalizePath(path) abort
@@ -146,6 +220,17 @@ function! s:FitTreeLabel(text, width) abort
   if strdisplaywidth(a:text) <= a:width
     return a:text
   endif
+  if a:width <= 3
+    let l:short = ''
+    for l:index in range(0, strchars(a:text) - 1)
+      let l:char = strcharpart(a:text, l:index, 1)
+      if strdisplaywidth(l:short . l:char) > a:width
+        break
+      endif
+      let l:short .= l:char
+    endfor
+    return l:short
+  endif
   let l:limit = max([1, a:width - 3])
   let l:result = ''
   for l:index in range(0, strchars(a:text) - 1)
@@ -172,6 +257,14 @@ function! s:ValidateSettings() abort
   if index(['auto', 'unicode', 'ascii'], get(s:settings, 'marker_style', 'auto')) < 0
     let s:settings.marker_style = 'auto'
   endif
+  if index(['aggressive', 'normal', 'minimal'], get(s:settings, 'watch_mode', 'aggressive')) < 0
+    let s:settings.watch_mode = 'aggressive'
+  endif
+  if index(['ask', 'keep-local', 'keep-external'], get(s:settings, 'conflict_strategy', 'ask')) < 0
+    let s:settings.conflict_strategy = 'ask'
+  endif
+  let s:settings.auto_reload = get(s:settings, 'auto_reload', 1) ? 1 : 0
+  let s:settings.verbose_changes = get(s:settings, 'verbose_changes', 1) ? 1 : 0
   let s:content_limit = s:settings.content_limit_kb * 1024
   let s:snapshot_budget = s:settings.snapshot_budget_kb * 1024
   let g:vide_settings = deepcopy(s:settings)
@@ -244,6 +337,176 @@ function! s:TreeError(message) abort
   let s:notice = 'ERROR: ' . a:message
   let g:vide_notice = s:notice
   redrawstatus
+endfunction
+
+function! s:GetConflictTempPath(path) abort
+  let l:hash = sha256(a:path)[:8]
+  if exists('*stdpath')
+    let l:cache_dir = stdpath('cache') . '/vide/conflicts'
+  else
+    let l:cache_dir = expand('~/.cache/vide/conflicts')
+  endif
+  return l:cache_dir . '/' . l:hash . '_' . fnamemodify(a:path, ':t')
+endfunction
+
+function! s:SaveExternalVersion(path) abort
+  let l:temp_path = s:GetConflictTempPath(a:path)
+  try
+    call mkdir(fnamemodify(l:temp_path, ':h'), 'p')
+    call writefile(readfile(a:path, 'b'), l:temp_path, 'b')
+  catch /^Vim\%((\a\+)\)\=:E/
+    " If we cannot save the temp file, log but continue
+  endtry
+endfunction
+
+function! s:CompareConflict() abort
+  let l:path = expand('%:p')
+  if !has_key(s:conflicts, l:path)
+    echomsg 'No conflict for this file'
+    return
+  endif
+  let l:temp_path = s:GetConflictTempPath(l:path)
+  if !filereadable(l:temp_path)
+    echomsg 'External version not available'
+    return
+  endif
+  " Use vertical split to compare
+  execute 'vertical diffsplit ' . fnameescape(l:temp_path)
+  setlocal readonly
+  setlocal buftype=nofile
+  setlocal bufhidden=wipe
+  execute 'file [External] ' . fnamemodify(l:path, ':t')
+  wincmd p
+endfunction
+
+function! s:TrackRecentChange(path, kind) abort
+  " Track for recent change highlighting
+  let s:recent_changes[a:path] = localtime()
+
+  " Track per-path frequency for priority calculation
+  let l:now = localtime()
+  if !has_key(s:change_stats, a:path)
+    let s:change_stats[a:path] = {'first': l:now, 'count': 0, 'kinds': []}
+  elseif l:now - s:change_stats[a:path].first >= 60
+    " Restart the window so old bursts don't keep a path prioritised forever
+    let s:change_stats[a:path] = {'first': l:now, 'count': 0, 'kinds': []}
+  endif
+  let s:change_stats[a:path].count += 1
+  call add(s:change_stats[a:path].kinds, a:kind)
+  if len(s:change_stats[a:path].kinds) > 10
+    call remove(s:change_stats[a:path].kinds, 0)
+  endif
+
+  " Append to the chronological change log
+  let l:display_path = fnamemodify(a:path, ':~:.')
+  let l:message = printf('[%s] %s', a:kind, l:display_path)
+  call add(s:change_log, {
+        \ 'time': l:now,
+        \ 'path': a:path,
+        \ 'kind': a:kind,
+        \ 'message': l:message
+        \ })
+
+  if len(s:change_log) > s:change_log_limit
+    call remove(s:change_log, 0, len(s:change_log) - s:change_log_limit - 1)
+  endif
+
+  let g:vide_last_change = l:message
+  if get(s:settings, 'verbose_changes', 1)
+    echomsg 'VIDE: ' . l:message
+  endif
+
+  " One shared expiry timer, not one per event: a busy agent can emit hundreds
+  " of writes per second, and a timer each would pile up unbounded.
+  call s:ScheduleRecentExpiry()
+endfunction
+
+function! s:ScheduleRecentExpiry() abort
+  if s:recent_timer >= 0 || !exists('*timer_start')
+    return
+  endif
+  let s:recent_timer = timer_start(1000, function('<SID>ExpireRecentChanges'))
+endfunction
+
+function! s:ExpireRecentChanges(timer) abort
+  let s:recent_timer = -1
+  let l:now = localtime()
+  let l:expired = 0
+  for [l:path, l:stamp] in items(s:recent_changes)
+    if l:now - l:stamp >= 5
+      call remove(s:recent_changes, l:path)
+      let l:expired = 1
+    endif
+  endfor
+  if l:expired
+    call s:Render()
+  endif
+  " Keep polling only while something is still pending.
+  if !empty(s:recent_changes)
+    call s:ScheduleRecentExpiry()
+  endif
+endfunction
+
+function! s:UpdatePriorityPaths() abort
+  " Detect frequently modified files (3+ changes in 60 seconds)
+  let l:now = localtime()
+  let s:priority_paths = []
+
+  for [l:path, l:info] in items(s:change_stats)
+    if l:now - l:info.first < 60 && l:info.count >= 3
+      call add(s:priority_paths, l:path)
+    endif
+  endfor
+endfunction
+
+function! s:ShowChangeHistory() abort
+  let l:lines = ['Recent file changes:', '']
+  for l:notif in reverse(copy(s:change_log))
+    let l:time_str = strftime('%H:%M:%S', l:notif.time)
+    call add(l:lines, printf('%s  %s', l:time_str, l:notif.message))
+  endfor
+
+  if len(l:lines) <= 2
+    call add(l:lines, 'No recent changes')
+  endif
+
+  " Reuse the history window when it is already open, otherwise repeated
+  " presses stack a new split each time.
+  let l:name = '[VIDE] Change History'
+  let l:existing = bufnr(l:name)
+  let l:winnr = l:existing > 0 ? bufwinnr(l:existing) : -1
+  if l:winnr > 0
+    execute l:winnr . 'wincmd w'
+  else
+    rightbelow new
+    setlocal buftype=nofile bufhidden=hide noswapfile nowrap nonumber
+    silent! execute 'file ' . fnameescape(l:name)
+    resize 15
+  endif
+
+  setlocal modifiable
+  silent %delete _
+  call setline(1, l:lines)
+  setlocal nomodifiable
+  call cursor(1, 1)
+  nnoremap <silent><buffer> q :<C-U>close<CR>
+endfunction
+
+function! s:ForceRefreshAll() abort
+  call s:TreeMessage('Refreshing all files...')
+  let l:count = 0
+  for l:path in keys(s:watch.contents)
+    if !filereadable(l:path)
+      continue
+    endif
+    let l:snapshot = s:ReadSnapshot(l:path)
+    let l:old_hash = get(s:watch.hashes, l:path, '')
+    if l:snapshot.hash !=# l:old_hash && !empty(l:snapshot.hash)
+      call s:HandleChangedPath(l:path, 'WRITE')
+      let l:count += 1
+    endif
+  endfor
+  call s:TreeMessage(printf('Refreshed: %d file(s) changed', l:count))
 endfunction
 
 function! s:PruneWatch(path) abort
@@ -372,7 +635,11 @@ function! s:ComparePaths(left, right) abort
 endfunction
 
 function! s:Children(path) abort
+  if has_key(s:children_cache, a:path)
+    return copy(s:children_cache[a:path])
+  endif
   let l:result = []
+  let l:ok = 1
   try
     if exists('*readdirex')
       for l:item in readdirex(a:path)
@@ -397,9 +664,14 @@ function! s:Children(path) abort
       endfor
     endif
   catch /^Vim\%((\a\+))\=:E/
-    return []
+    let l:ok = 0
   endtry
-  return sort(l:result, function('s:ComparePaths'))
+  if !l:ok
+    return []
+  endif
+  let l:result = sort(l:result, function('s:ComparePaths'))
+  let s:children_cache[a:path] = copy(l:result)
+  return l:result
 endfunction
 
 function! s:AddNode(path, depth, lines, nodes) abort
@@ -422,18 +694,33 @@ function! s:AddNode(path, depth, lines, nodes) abort
   endif
 endfunction
 
+" Matches belong to a window, not a buffer, so the ids are tracked in a
+" window-local variable.  Keeping them in b: leaves stale ids behind whenever
+" the tree buffer is shown in a different window.
 function! s:ApplyChangedHighlight() abort
-  if exists('b:vide_change_match') && b:vide_change_match > 0
-    silent! call matchdelete(b:vide_change_match)
-  endif
-  let b:vide_change_match = -1
-  if empty(s:changed_path)
+  for l:id in get(w:, 'vide_matches', [])
+    silent! call matchdelete(l:id)
+  endfor
+  let w:vide_matches = []
+
+  let l:nodes = get(b:, 'vide_nodes', [])
+  if empty(l:nodes)
     return
   endif
-  for l:node in get(b:, 'vide_nodes', [])
-    if l:node.path ==# s:changed_path
-      let b:vide_change_match = matchaddpos('VideChanged', [[l:node.line, 1, -1]], 20)
-      return
+  let l:now = localtime()
+
+  for l:node in l:nodes
+    " Highest priority first: a conflict matters more than a plain change.
+    if has_key(s:conflicts, l:node.path)
+      call add(w:vide_matches,
+            \ matchaddpos('VideConflict', [[l:node.line, 1, -1]], 25))
+    elseif l:node.path ==# s:changed_path
+      call add(w:vide_matches,
+            \ matchaddpos('VideChanged', [[l:node.line, 1, -1]], 20))
+    elseif has_key(s:recent_changes, l:node.path)
+          \ && l:now - s:recent_changes[l:node.path] < 5
+      call add(w:vide_matches,
+            \ matchaddpos('VideRecentChange', [[l:node.line, 1, -1]], 15))
     endif
   endfor
 endfunction
@@ -457,6 +744,8 @@ function! s:Render() abort
   endif
   let b:vide_nodes = l:nodes
   setlocal nomodifiable
+  " Conflict count for the statusline (0 means no marker)
+  let b:vide_conflict_count = len(s:conflicts)
   call s:ApplyChangedHighlight()
   if !empty(s:selected_path)
     for l:node in l:nodes
@@ -515,6 +804,45 @@ function! s:EditorWindow() abort
   return -1
 endfunction
 
+" Record that a file changed externally while the user had unsaved edits, and
+" stash the external text so <F5> can diff the two versions.
+function! s:RegisterConflict(path) abort
+  let l:path = s:NormalizePath(a:path)
+  if empty(l:path)
+    return
+  endif
+  let l:known = has_key(s:conflicts, l:path)
+  let s:conflicts[l:path] = {
+        \ 'time': localtime(),
+        \ 'user_modified': 1,
+        \ 'need_review': 1}
+  call s:SaveExternalVersion(l:path)
+  call s:Render()
+  if !l:known
+    echohl WarningMsg
+    echomsg 'CONFLICT: ' . fnamemodify(l:path, ':t')
+          \ . ' - external change detected, your edits kept (<F5> to compare)'
+    echohl None
+  endif
+endfunction
+
+function! s:FileChangedShell() abort
+  " An agent may replace a file while it is visible in Vim.  Do not stop on
+  " Vim's interactive "file changed" prompt: reload clean buffers and keep
+  " unsaved buffers exactly as the user left them.
+  let l:path = expand('<afile>:p')
+  if &modified
+    let v:fcs_choice = 'use'
+    call s:RegisterConflict(l:path)
+  else
+    let v:fcs_choice = 'reload'
+    if has_key(s:conflicts, l:path)
+      call remove(s:conflicts, l:path)
+      call s:Render()
+    endif
+  endif
+endfunction
+
 function! s:OpenFile(path, line) abort
   let l:winid = s:EditorWindow()
   if l:winid < 0 || !win_gotoid(l:winid)
@@ -523,7 +851,24 @@ function! s:OpenFile(path, line) abort
   if &modified && expand('%:p') ==# a:path
     " Never issue :edit on the active unsaved buffer: that would trigger an
     " interactive E37 prompt from the asynchronous watcher callback.
+    " Record the conflict here too -- FileChangedShell only runs when Vim
+    " itself notices the change, which this watcher-driven path pre-empts.
+    call s:RegisterConflict(a:path)
     call s:TreeError('external change detected; unsaved buffer preserved')
+    return
+  endif
+  if expand('%:p') ==# a:path && !&modified
+    " Reload the existing buffer without opening a second instance or
+    " re-entering Vim's swap-file warning path.
+    silent! noautocmd keepalt edit!
+    call cursor(max([1, a:line]), 1)
+    return
+  endif
+  let l:existing = bufnr(a:path)
+  if l:existing > 0 && bufloaded(l:existing)
+    execute 'buffer ' . l:existing
+    call cursor(max([1, a:line]), 1)
+    normal! zv
     return
   endif
   if &modified && expand('%:p') !=# a:path
@@ -599,6 +944,7 @@ function! s:CreateNode() abort
   if !s:FsCall(l:operation, [l:path])
     return
   endif
+  call s:InvalidateTreeCache()
   if l:kind == 1
     call s:RememberPath(l:path)
   endif
@@ -623,6 +969,7 @@ function! s:DeleteNode() abort
   if !s:FsCall('delete', [l:node.path])
     return
   endif
+  call s:InvalidateTreeCache()
   call s:PruneWatch(l:node.path)
   if s:changed_path ==# l:node.path || stridx(s:changed_path, l:node.path . '/') ==# 0
     let s:changed_path = ''
@@ -656,6 +1003,7 @@ function! s:RenameNode() abort
   if !s:FsCall('rename', [l:old, l:new])
     return
   endif
+  call s:InvalidateTreeCache()
   call s:RemapPaths(s:expanded, l:old, l:new)
   call s:RemapPaths(s:watch.baseline, l:old, l:new)
   call s:RemapPaths(s:watch.signatures, l:old, l:new)
@@ -712,40 +1060,138 @@ function! s:SnapshotCost(contents, size) abort
   return a:size + len(a:contents) * 32 + 64
 endfunction
 
+function! s:NewBaselineState(files) abort
+  return {'files': a:files, 'index': 0, 'bytes': 0, 'signatures': {},
+        \ 'hashes': {}, 'contents': {}, 'baseline': {}, 'sizes': {},
+        \ 'diffs': {}, 'order': [], 'phase': 'snapshot', 'stack': []}
+endfunction
+
+function! s:CollectBaselineFile(state, path) abort
+  if !s:CanWatch(a:path)
+    return
+  endif
+  let l:size = getfsize(a:path)
+  let a:state.signatures[a:path] = getftime(a:path) . ':' . l:size
+  if l:size < 0 || l:size > s:content_limit
+    return
+  endif
+  " Do not open every small file once the snapshot budget can no longer
+  " accommodate it.  The previous code read the file first and only then
+  " checked the budget, making large projects pay the full I/O cost even for
+  " snapshots that were immediately discarded.
+  let l:minimum_cost = s:SnapshotCost([], l:size)
+  if a:state.bytes + l:minimum_cost > s:snapshot_budget
+    return
+  endif
+  let l:snapshot = s:ReadSnapshot(a:path)
+  let l:cost = s:SnapshotCost(l:snapshot.contents, l:snapshot.size)
+  if a:state.bytes + l:cost > s:snapshot_budget
+    return
+  endif
+  let a:state.hashes[a:path] = l:snapshot.hash
+  let a:state.contents[a:path] = l:snapshot.contents
+  let a:state.baseline[a:path] = {'hash': l:snapshot.hash, 'size': l:snapshot.size}
+  let a:state.sizes[a:path] = l:cost
+  call add(a:state.order, a:path)
+  let a:state.bytes += l:cost
+endfunction
+
+function! s:BaselineResult(state) abort
+  return {'baseline': a:state.baseline, 'signatures': a:state.signatures,
+        \ 'hashes': a:state.hashes, 'contents': a:state.contents,
+        \ 'snapshot_sizes': a:state.sizes, 'diffs': a:state.diffs}
+endfunction
+
 function! s:CollectWatch() abort
   " This is the one startup baseline. All later updates arrive as OS events.
   let l:files = []
-  let l:signatures = {}
-  let l:hashes = {}
-  let l:contents = {}
-  let l:baseline = {}
-  let l:sizes = {}
-  let l:diffs = {}
-  let l:bytes = 0
-  let s:snapshot_order = []
   call s:CollectFiles(s:root, l:files)
+  let l:state = s:NewBaselineState(l:files)
   for l:path in l:files
-    if !s:CanWatch(l:path)
-      continue
-    endif
-    let l:size = getfsize(l:path)
-    let l:signatures[l:path] = getftime(l:path) . ':' . l:size
-    if l:size >= 0 && l:size <= s:content_limit
-      let l:snapshot = s:ReadSnapshot(l:path)
-      let l:cost = s:SnapshotCost(l:snapshot.contents, l:snapshot.size)
-      if l:bytes + l:cost > s:snapshot_budget
+    call s:CollectBaselineFile(l:state, l:path)
+  endfor
+  let s:snapshot_order = l:state.order
+  let s:snapshot_bytes = l:state.bytes
+  return s:BaselineResult(l:state)
+endfunction
+
+function! s:FinishAsyncBaseline() abort
+  let s:snapshot_order = s:baseline_state.order
+  let s:snapshot_bytes = s:baseline_state.bytes
+  let s:watch = s:BaselineResult(s:baseline_state)
+  let s:baseline_state = {}
+  let s:baseline_timer = -1
+  let s:initializing = 0
+  let s:workspace_ready = 1
+  call s:Render()
+  call s:RefreshSplash()
+  call s:DrainPendingEvents()
+endfunction
+
+function! s:BaselineTick(timer) abort
+  if empty(s:baseline_state)
+    let s:baseline_timer = -1
+    return
+  endif
+  let l:start = reltime()
+  let l:count = 0
+  if s:baseline_state.phase ==# 'walk'
+    " Directory enumeration is also incremental.  A recursive CollectFiles()
+    " here used to block all keyboard input before the timer even started.
+    while !empty(s:baseline_state.stack)
+      let l:directory = remove(s:baseline_state.stack, -1)
+      if l:directory =~# '/\.git\%(/\|$\)' || s:ShouldIgnore(l:directory)
         continue
       endif
-      let l:hashes[l:path] = l:snapshot.hash
-      let l:contents[l:path] = l:snapshot.contents
-      let l:baseline[l:path] = {'hash': l:snapshot.hash, 'size': l:snapshot.size}
-      let l:sizes[l:path] = l:cost
-      call add(s:snapshot_order, l:path)
-      let l:bytes += l:cost
+      for l:entry in s:Children(l:directory)
+        if s:IsDirectory(l:entry)
+          call add(s:baseline_state.stack, l:entry)
+        elseif s:CanWatch(l:entry)
+          call add(s:baseline_state.files, l:entry)
+        endif
+      endfor
+      let l:count += 1
+      if l:count >= 16 || reltimefloat(reltime(l:start)) >= 0.02
+        break
+      endif
+    endwhile
+    if empty(s:baseline_state.stack)
+      let s:baseline_state.phase = 'snapshot'
     endif
-  endfor
-  let s:snapshot_bytes = l:bytes
-  return {'baseline': l:baseline, 'signatures': l:signatures, 'hashes': l:hashes, 'contents': l:contents, 'snapshot_sizes': l:sizes, 'diffs': l:diffs}
+  else
+    while s:baseline_state.index < len(s:baseline_state.files)
+      let l:path = s:baseline_state.files[s:baseline_state.index]
+      let s:baseline_state.index += 1
+      call s:CollectBaselineFile(s:baseline_state, l:path)
+      let l:count += 1
+      if l:count >= 64 || reltimefloat(reltime(l:start)) >= 0.02
+        break
+      endif
+    endwhile
+  endif
+  if s:baseline_state.phase ==# 'snapshot' && s:baseline_state.index >= len(s:baseline_state.files)
+    call s:FinishAsyncBaseline()
+  else
+    " Yield to Vim's input loop between slices.  Re-arming a zero-delay timer
+    " continuously can starve keyboard and mouse events on large projects.
+    if exists('*timer_start')
+      let s:baseline_timer = timer_start(10, function('<SID>BaselineTick'))
+    else
+      call s:BaselineTick(-1)
+    endif
+  endif
+endfunction
+
+function! s:BeginBaseline() abort
+  let s:baseline_state = s:NewBaselineState([])
+  let s:baseline_state.phase = 'walk'
+  let s:baseline_state.stack = [s:root]
+  let s:initializing = 1
+  if exists('*timer_start')
+    let s:baseline_timer = timer_start(0, function('<SID>BaselineTick'))
+  else
+    call s:BaselineTick(-1)
+  endif
 endfunction
 
 function! s:StoreSnapshot(path, contents) abort
@@ -761,18 +1207,35 @@ function! s:StoreSnapshot(path, contents) abort
   call filter(s:snapshot_order, 'v:val !=# a:path')
   let l:size = getfsize(a:path)
   let l:cost = s:SnapshotCost(a:contents, l:size)
+
+  " Check if this is a priority path
+  let l:is_priority = index(s:priority_paths, a:path) >= 0
+
   if l:size >= 0 && l:size <= s:content_limit
     let s:watch.contents[a:path] = a:contents
     let s:watch.snapshot_sizes[a:path] = l:cost
+    if l:is_priority
+      let s:snapshot_priorities[a:path] = 1
+    endif
     let s:snapshot_bytes += l:cost
     call add(s:snapshot_order, a:path)
   else
     if has_key(s:watch.contents, a:path)
       call remove(s:watch.contents, a:path)
     endif
+    if has_key(s:snapshot_priorities, a:path)
+      call remove(s:snapshot_priorities, a:path)
+    endif
   endif
+
+  " Budget cleanup - skip priority files
   while s:snapshot_bytes > s:snapshot_budget && !empty(s:watch.contents)
     let l:victim = remove(s:snapshot_order, 0)
+    " Skip high priority files
+    if get(s:snapshot_priorities, l:victim, 0)
+      call add(s:snapshot_order, l:victim)
+      continue
+    endif
     let s:snapshot_bytes -= get(s:watch.snapshot_sizes, l:victim, 0)
     call remove(s:watch.snapshot_sizes, l:victim)
     call remove(s:watch.contents, l:victim)
@@ -839,12 +1302,17 @@ function! s:HandleChangedPath(path, kind) abort
     call s:TreeError('project root was removed or moved')
     return
   endif
+  if index(['CREATE', 'MOVE_IN'], l:kind) >= 0
+    call s:InvalidateTreeCache()
+  endif
   if index(['MOVE_OUT', 'DELETE'], l:kind) >= 0
+    call s:InvalidateTreeCache()
     call s:PruneWatch(l:path)
     call s:Render()
     return
   endif
   if l:kind ==# 'DIR' || s:IsDirectory(l:path)
+    call s:InvalidateTreeCache()
     call s:Render()
     return
   endif
@@ -853,6 +1321,7 @@ function! s:HandleChangedPath(path, kind) abort
       let s:selected_path = ''
     endif
     call s:PruneWatch(l:path)
+    call s:InvalidateTreeCache()
     call s:Render()
     return
   endif
@@ -860,10 +1329,20 @@ function! s:HandleChangedPath(path, kind) abort
   let l:signature = getftime(l:path) . ':' . getfsize(l:path)
   let l:snapshot = s:ReadSnapshot(l:path)
   let l:hash = l:snapshot.hash
-  if l:kind ==# 'ATTRIB' && get(s:watch.signatures, l:path, '') ==# l:signature
-        \ && get(s:watch.hashes, l:path, '') ==# l:hash
-    return
+
+  " A metadata-only event (chmod, touch) carries no content change, so accept
+  " it just when the hash really moved.  'minimal' mode drops them outright.
+  if l:kind ==# 'ATTRIB'
+    if s:GetWatchBehavior().ignore_attrib
+      return
+    endif
+    if has_key(s:watch.hashes, l:path) &&
+          \ get(s:watch.hashes, l:path, '') ==# l:hash &&
+          \ !empty(l:hash)
+      return
+    endif
   endif
+
   let l:before = get(s:watch.contents, l:path, [])
   let l:after = l:snapshot.contents
   let s:watch.signatures[l:path] = l:signature
@@ -879,13 +1358,97 @@ function! s:HandleChangedPath(path, kind) abort
   endif
   let s:watch.diffs[l:path] = s:BuildDiff(l:before, l:after)
   call s:StoreSnapshot(l:path, l:after)
+
+  " Track recent changes and update priority
+  call s:TrackRecentChange(l:path, l:kind)
+  call s:UpdatePriorityPaths()
+
   let s:changed_path = l:path
   let s:selected_path = l:path
   let s:changed_line = s:FirstChangedLine(l:before, l:after)
   call s:Reveal(l:path)
+  " s:Render already moves the cursor to s:selected_path, so a separate
+  " s:SelectPath call here would only repeat the window switch.
   call s:Render()
-  call s:SelectPath(l:path)
   call s:OpenFile(l:path, s:changed_line)
+endfunction
+
+function! s:FlushChangedEvents(timer) abort
+  let s:event_timer = -1
+  if s:initializing || empty(s:pending_events)
+    return
+  endif
+  let l:events = s:pending_events
+  let s:pending_events = []
+  let l:compact = []
+  let l:last_attribute = {}
+  for l:event in l:events
+    let l:kind = l:event[0]
+    let l:path = l:event[1]
+    if index(['WRITE', 'ATTRIB'], l:kind) >= 0 && has_key(l:last_attribute, l:path)
+      let l:compact[l:last_attribute[l:path]] = l:event
+    else
+      call add(l:compact, l:event)
+      if index(['WRITE', 'ATTRIB'], l:kind) >= 0
+        let l:last_attribute[l:path] = len(l:compact) - 1
+      endif
+    endif
+  endfor
+  for l:event in l:compact
+    call s:HandleChangedPath(l:event[1], l:event[0])
+  endfor
+endfunction
+
+function! s:QueueChangedEvent(kind, path) abort
+  if !exists('*timer_start')
+    call s:HandleChangedPath(a:path, a:kind)
+    return
+  endif
+  call add(s:pending_events, [a:kind, a:path])
+  if s:event_timer < 0
+    " Get behavior based on watch mode
+    let l:behavior = s:GetWatchBehavior()
+    let s:event_timer = timer_start(l:behavior.event_delay_ms, function('<SID>FlushChangedEvents'))
+  endif
+endfunction
+
+function! s:GetWatchBehavior() abort
+  let l:mode = get(s:settings, 'watch_mode', 'aggressive')
+  if l:mode ==# 'aggressive'
+    return {
+          \ 'event_delay_ms': 5,
+          \ 'force_reload': 1,
+          \ 'ignore_attrib': 0,
+          \ 'show_all_changes': 1
+          \ }
+  elseif l:mode ==# 'minimal'
+    return {
+          \ 'event_delay_ms': 50,
+          \ 'force_reload': 0,
+          \ 'ignore_attrib': 1,
+          \ 'show_all_changes': 0
+          \ }
+  else
+    return {
+          \ 'event_delay_ms': 20,
+          \ 'force_reload': 0,
+          \ 'ignore_attrib': 0,
+          \ 'show_all_changes': 1
+          \ }
+  endif
+endfunction
+
+function! s:AdjustWatchMode() abort
+  " Drop the timer armed with the previous delay, then drain what is queued so
+  " nothing waits on a timer that no longer exists.
+  if s:event_timer >= 0
+    silent! call timer_stop(s:event_timer)
+    let s:event_timer = -1
+  endif
+  if !empty(s:pending_events)
+    call s:FlushChangedEvents(-1)
+  endif
+  echomsg 'Watch mode set to: ' . s:settings.watch_mode
 endfunction
 
 function! s:WatchEvent(channel, message) abort
@@ -927,7 +1490,7 @@ function! s:WatchEvent(channel, message) abort
       if s:initializing
         call add(s:pending_events, [l:kind, l:path])
       else
-        call s:HandleChangedPath(l:path, l:kind)
+        call s:QueueChangedEvent(l:kind, l:path)
       endif
     endwhile
   finally
@@ -987,6 +1550,20 @@ endfunction
 
 function! s:StopWatcher() abort
   let s:watcher_stopping = 1
+  " Timer ids start at 0, so compare against the -1 'unset' marker.
+  if s:baseline_timer >= 0
+    silent! call timer_stop(s:baseline_timer)
+    let s:baseline_timer = -1
+  endif
+  let s:baseline_state = {}
+  if s:event_timer >= 0
+    silent! call timer_stop(s:event_timer)
+    let s:event_timer = -1
+  endif
+  if s:recent_timer >= 0
+    silent! call timer_stop(s:recent_timer)
+    let s:recent_timer = -1
+  endif
   if type(s:watch_job) == v:t_job
     let s:stopped_watch_jobs[string(s:watch_job)] = 1
     silent! call job_stop(s:watch_job, 'term')
@@ -1000,11 +1577,7 @@ function! s:RestartWatcher() abort
 endfunction
 
 function! s:DrainPendingEvents() abort
-  let l:events = s:pending_events
-  let s:pending_events = []
-  for l:event in l:events
-    call s:HandleChangedPath(l:event[1], l:event[0])
-  endfor
+  call s:FlushChangedEvents(-1)
 endfunction
 
 function! s:CloseSettings() abort
@@ -1015,14 +1588,38 @@ function! s:CloseSettings() abort
 endfunction
 
 function! s:ApplySetting(index, value) abort
-  if a:index != 4 && a:value !~# '^\d\+$'
-    call s:TreeError('enter a whole number')
-    return
+  " Numeric settings: reject non-numbers and values outside the advertised
+  " range instead of silently clamping a typo to a surprising value.
+  if a:index <= 3
+    if a:value !~# '^\d\+$'
+      call s:TreeError('enter a whole number')
+      return
+    endif
+    let l:keys = ['sidebar_percent', 'content_limit_kb', 'snapshot_budget_kb']
+    let l:bounds = s:setting_ranges[l:keys[a:index - 1]]
+    let l:number = str2nr(a:value)
+    if l:number < l:bounds[0] || l:number > l:bounds[1]
+      call s:TreeError(printf('value must be between %d and %d', l:bounds[0], l:bounds[1]))
+      return
+    endif
   endif
   if a:index == 4 && index(['auto', 'unicode', 'ascii'], tolower(trim(a:value))) < 0
     call s:TreeError('marker style must be auto, unicode, or ascii')
     return
   endif
+  if a:index == 5 && index(['aggressive', 'normal', 'minimal'], tolower(trim(a:value))) < 0
+    call s:TreeError('watch mode must be aggressive, normal, or minimal')
+    return
+  endif
+  if a:index == 6 && index(['ask', 'use', 'reload'], tolower(trim(a:value))) < 0
+    call s:TreeError('conflict strategy must be ask, use, or reload')
+    return
+  endif
+  if a:index == 7 && index(['on', 'off', '1', '0'], tolower(trim(a:value))) < 0
+    call s:TreeError('verbose changes must be on/off or 1/0')
+    return
+  endif
+
   if a:index == 1
     let s:settings.sidebar_percent = str2nr(a:value)
   elseif a:index == 2
@@ -1031,6 +1628,14 @@ function! s:ApplySetting(index, value) abort
     let s:settings.snapshot_budget_kb = str2nr(a:value)
   elseif a:index == 4
     let s:settings.marker_style = tolower(trim(a:value))
+  elseif a:index == 5
+    let s:settings.watch_mode = tolower(trim(a:value))
+    call s:AdjustWatchMode()
+  elseif a:index == 6
+    let s:settings.conflict_strategy = tolower(trim(a:value))
+  elseif a:index == 7
+    let l:val = tolower(trim(a:value))
+    let s:settings.verbose_changes = (l:val ==# 'on' || l:val ==# '1')
   endif
   call s:ValidateSettings()
   call s:SaveSettings()
@@ -1039,7 +1644,7 @@ function! s:ApplySetting(index, value) abort
 endfunction
 
 function! s:EditSetting(index) abort
-  if a:index < 1 || a:index > 4
+  if a:index < 1 || a:index > 7
     return
   endif
   call s:CloseSettings()
@@ -1049,8 +1654,14 @@ function! s:EditSetting(index) abort
     let l:value = input('Per-file snapshot limit (64-4096 KB) [' . s:settings.content_limit_kb . ']: ')
   elseif a:index == 3
     let l:value = input('Snapshot budget (1024-65536 KB) [' . s:settings.snapshot_budget_kb . ']: ')
-  else
+  elseif a:index == 4
     let l:value = input('Marker style (auto/unicode/ascii) [' . s:settings.marker_style . ']: ')
+  elseif a:index == 5
+    let l:value = input('Watch mode (aggressive/normal/minimal) [' . s:settings.watch_mode . ']: ')
+  elseif a:index == 6
+    let l:value = input('Conflict strategy (ask/use/reload) [' . s:settings.conflict_strategy . ']: ')
+  elseif a:index == 7
+    let l:value = input('Verbose changes (on/off) [' . (s:settings.verbose_changes ? 'on' : 'off') . ']: ')
   endif
   if !empty(l:value)
     call s:ApplySetting(a:index, l:value)
@@ -1070,8 +1681,15 @@ function! s:OpenSettings() abort
     return
   endif
   if !exists('*popup_create') || &lines < 12 || &columns < 45
-    let l:choice = inputlist(['VIDE SETTINGS', '1. Sidebar width: ' . s:settings.sidebar_percent . '%', '2. Per-file snapshot: ' . s:settings.content_limit_kb . ' KB', '3. Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB', '4. Marker style: ' . s:settings.marker_style])
-    if l:choice >= 1 && l:choice <= 4
+    let l:choice = inputlist(['VIDE SETTINGS',
+          \ '1. Sidebar width: ' . s:settings.sidebar_percent . '%',
+          \ '2. Per-file snapshot: ' . s:settings.content_limit_kb . ' KB',
+          \ '3. Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB',
+          \ '4. Marker style: ' . s:settings.marker_style,
+          \ '5. Watch mode: ' . s:settings.watch_mode,
+          \ '6. Conflict strategy: ' . s:settings.conflict_strategy,
+          \ '7. Verbose changes: ' . (s:settings.verbose_changes ? 'ON' : 'OFF')])
+    if l:choice >= 1 && l:choice <= 7
       let l:value = input('New value: ')
       if !empty(l:value)
         call s:ApplySetting(l:choice, l:value)
@@ -1079,13 +1697,16 @@ function! s:OpenSettings() abort
     endif
     return
   endif
-  let l:width = min([50, max([32, &columns - 8])])
+  let l:width = min([60, max([32, &columns - 8])])
   highlight PmenuSel cterm=bold ctermfg=Black ctermbg=DarkCyan gui=bold guifg=Black guibg=DarkCyan
   let l:items = [
         \ 'Sidebar width: ' . s:settings.sidebar_percent . '%',
         \ 'Per-file snapshot: ' . s:settings.content_limit_kb . ' KB',
         \ 'Snapshot budget: ' . s:settings.snapshot_budget_kb . ' KB',
-        \ 'Marker style: ' . s:settings.marker_style]
+        \ 'Marker style: ' . s:settings.marker_style,
+        \ 'Watch mode: ' . s:settings.watch_mode . ' (aggressive/normal/minimal)',
+        \ 'Conflict strategy: ' . s:settings.conflict_strategy . ' (ask/use/reload)',
+        \ 'Verbose changes: ' . (s:settings.verbose_changes ? 'ON' : 'OFF')]
   let s:settings_popup = popup_menu(l:items, {
         \ 'pos': 'center', 'minwidth': l:width, 'maxwidth': l:width,
         \ 'padding': [1, 2, 1, 2], 'border': [1, 1, 1, 1],
@@ -1104,12 +1725,96 @@ function! s:ResizeSidebar() abort
   call s:RefreshSplash()
 endfunction
 
+" Built via '%!' rather than '%{}' so the highlight items below are parsed by
+" Vim instead of being shown literally: '%{}' inserts its result as plain text.
+function! vide#TreeStatusline() abort
+  let l:parts = ['%#VideStatus# VIDE %*']
+
+  let l:conflicts = get(b:, 'vide_conflict_count', 0)
+  if l:conflicts > 0
+    call add(l:parts, printf('%%#VideConflict# %s CONFLICT%s %%*',
+          \ s:ConflictMarker(), l:conflicts > 1 ? 'S(' . l:conflicts . ')' : ''))
+  endif
+
+  let l:backend = get(g:, 'vide_watch_backend', 'OFF')
+  let l:position = printf('%d/%d', line('.'), line('$'))
+
+  " Measure the fixed text exactly rather than estimating: the sidebar is
+  " narrow, so an over-generous budget makes '%<' cut a token in half.
+  let l:fixed = strwidth(' VIDE ') + strwidth(' ' . l:backend . ' ')
+        \ + strwidth(' ' . l:position . ' ')
+  if l:conflicts > 0
+    let l:fixed += strwidth(printf(' %s CONFLICT%s ', s:ConflictMarker(),
+          \ l:conflicts > 1 ? 'S(' . l:conflicts . ')' : ''))
+  endif
+
+  let l:notice = get(g:, 'vide_notice', '')
+  let l:detail = !empty(l:notice) ? l:notice : get(g:, 'vide_last_change', '')
+  let l:room = s:StatusWidth() - l:fixed - 1
+
+  call add(l:parts, '%=%#VideStatusMeta# ')
+  call add(l:parts, s:StatuslineEscape(l:backend) . ' ')
+  if !empty(l:detail) && l:room >= 4
+    call add(l:parts, s:StatuslineEscape(s:ShortenForStatus(l:detail, l:room)) . ' ')
+  endif
+  call add(l:parts, s:StatuslineEscape(l:position) . ' ')
+  return join(l:parts, '')
+endfunction
+
+" Width available to the tree statusline. '%!' is evaluated while Vim draws a
+" specific window, so resolve the sidebar window explicitly instead of trusting
+" the ambient winwidth(0).
+function! s:StatusWidth() abort
+  if s:tree_win > 0 && win_id2win(s:tree_win) > 0
+    return winwidth(win_id2win(s:tree_win))
+  endif
+  return winwidth(0)
+endfunction
+
+" Dynamic text must not be re-read as statusline syntax.
+function! s:StatuslineEscape(text) abort
+  return substitute(a:text, '%', '%%', 'g')
+endfunction
+
+" Shorten a status message to fit the sidebar.  For a change message
+" ('[WRITE] a/b/c.py') the filename is what matters, so leading path segments
+" go first; for prose the meaning is up front, so keep the head instead.
+function! s:ShortenForStatus(text, width) abort
+  if strwidth(a:text) <= a:width
+    return a:text
+  endif
+
+  let l:kind = matchstr(a:text, '^\[\w\+\]\s*')
+  if !empty(l:kind) || a:text =~# '/'
+    let l:body = a:text[len(l:kind):]
+    let l:segments = split(l:body, '/')
+    while len(l:segments) > 1
+      call remove(l:segments, 0)
+      let l:candidate = l:kind . '…/' . join(l:segments, '/')
+      if strwidth(l:candidate) <= a:width
+        return l:candidate
+      endif
+    endwhile
+    let l:tail = empty(l:segments) ? l:body : l:segments[-1]
+    if strwidth(l:tail) <= a:width
+      return l:tail
+    endif
+    return '…' . strcharpart(l:tail, strchars(l:tail) - a:width + 1)
+  endif
+
+  return strcharpart(a:text, 0, a:width - 1) . '…'
+endfunction
+
+function! s:ConflictMarker() abort
+  return get(s:settings, 'marker_style', 'unicode') ==# 'ascii' ? '!' : '⚠'
+endfunction
+
 function! s:SetupTreeBuffer() abort
   setlocal buftype=nofile bufhidden=wipe nobuflisted noswapfile nowrap nonumber norelativenumber
   setlocal cursorline cursorlineopt=line signcolumn=no foldcolumn=0 colorcolumn=
   setlocal winfixwidth
   setlocal winhighlight=Normal:VideExplorerNormal,CursorLine:VideExplorerCursor,StatusLine:VideStatusLine,StatusLineNC:VideStatusLineNC,VertSplit:VideDivider
-  setlocal statusline=%#VideStatus#\ VIDE\ %*%<%=%#VideStatusMeta#\ %{get(g:,\ 'vide_watch_backend',\ 'OFF')}\ %{get(g:,\ 'vide_notice',\ '')}\ \ %l/%L\ 
+  setlocal statusline=%!vide#TreeStatusline()
   syntax clear
   syntax match VideTreeDirectory '^\s*[▶▼v>]\s.*$'
   syntax match VideTreeRoot '^\(▼\|v\).*$'
@@ -1131,6 +1836,16 @@ function! s:SetupTreeBuffer() abort
   nnoremap <silent><buffer> <LeftRelease> :<C-U>call <SID>MouseActivate()<CR>
 endfunction
 
+" Conflict and change management.  <C-H> is deliberately not mapped globally:
+" most terminals send the same byte for <C-H> and <BS>, so a global mapping
+" would break Backspace in the editor window.
+nnoremap <silent> <F5> :<C-U>call <SID>CompareConflict()<CR>
+nnoremap <silent> <F6> :<C-U>call <SID>ForceRefreshAll()<CR>
+nnoremap <silent> <F7> :<C-U>call <SID>ShowChangeHistory()<CR>
+command! VideChanges call <SID>ShowChangeHistory()
+command! VideRefresh call <SID>ForceRefreshAll()
+command! VideDiff call <SID>CompareConflict()
+
 function! s:StyleEditorWindow() abort
   if win_id2win(s:editor_win) > 0
     call win_execute(s:editor_win, 'setlocal nowrap sidescroll=1 winhighlight=StatusLine:VideStatusLine,StatusLineNC:VideStatusLineNC,VertSplit:VideDivider')
@@ -1147,9 +1862,10 @@ function! s:ShowSplash() abort
     return
   endif
   let l:lines = ['', s:Centered('VIDE'), '']
+  let l:hint = s:workspace_ready ? 'Select a file to open' : 'Loading workspace...'
   if winwidth(0) < 34
     " Keep every splash line inside a narrow editor split.
-    call extend(l:lines, [s:Centered('Vim IDE'), s:Centered('Loading...')])
+    call extend(l:lines, [s:Centered('Vim IDE'), s:Centered(s:workspace_ready ? 'Ready' : 'Loading...')])
   else
     let l:logo = [
           \ ' __     ___ ____  _____ ',
@@ -1160,7 +1876,7 @@ function! s:ShowSplash() abort
     for l:line in l:logo
       call add(l:lines, s:Centered(l:line))
     endfor
-    call extend(l:lines, ['', s:Centered('Vim Development Environment'), s:Centered('Loading workspace...')])
+    call extend(l:lines, ['', s:Centered('Vim Development Environment'), s:Centered(l:hint)])
   endif
   setlocal modifiable
   silent %delete _
@@ -1171,7 +1887,7 @@ function! s:ShowSplash() abort
   syntax clear
   syntax match VideSplash '^\s*__.*$'
   syntax match VideSplash '^\s*\\.*$'
-  syntax match VideSplashText 'VIDE\|Vim Development Environment\|Loading workspace...'
+  syntax match VideSplashText 'VIDE\|Vim Development Environment\|Loading workspace...\|Select a file to open\|Ready'
 endfunction
 
 function! s:RefreshSplash() abort
@@ -1198,16 +1914,19 @@ function! s:Start() abort
   let s:tree_buf = bufnr('%')
   call s:SetupTreeBuffer()
   call s:ResizeSidebar()
-  call s:Render()
   call s:StyleEditorWindow()
   call win_gotoid(s:editor_win)
   call s:ShowSplash()
+  call s:InvalidateTreeCache()
+  " Draw the root immediately.  The full baseline below reuses this cache,
+  " so showing the tree early does not reintroduce a second walk.
+  call s:Render()
+  redraw!
   let s:snapshot_order = []
-  let s:initializing = 1
   call s:StartWatcher()
-  let s:watch = s:CollectWatch()
-  let s:initializing = 0
-  call s:DrainPendingEvents()
+  " Establish the baseline in short timer slices so Vim can paint and accept
+  " input while a large project is being opened.
+  call s:BeginBaseline()
 endfunction
 
 function! s:MaybeExitAfterEditorClose() abort
@@ -1242,12 +1961,18 @@ augroup vide_runtime
   autocmd!
   autocmd VimEnter * call vide#core#start()
   autocmd VimResized * call vide#core#start() | call vide#ui#resize()
+  autocmd FileChangedShell * call <SID>FileChangedShell()
   autocmd BufReadPost * call <SID>RememberPath(expand('<afile>:p'))
   autocmd BufWritePost * call <SID>RememberPath(expand('<afile>:p'))
   autocmd WinClosed * call <SID>MaybeExitAfterEditorClose()
   autocmd VimLeavePre * call vide#core#stop()
   autocmd VimLeavePre * if s:interrupt_timer > 0 | call timer_stop(s:interrupt_timer) | endif
 augroup END
+
+" Define highlight groups for conflict and change visualization
+highlight default VideConflict ctermfg=Yellow ctermbg=NONE guifg=#E5C07B guibg=NONE gui=bold cterm=bold
+highlight default VideRecentChange ctermfg=Cyan ctermbg=NONE guifg=#56B6C2 guibg=NONE
+highlight default VideChanged ctermfg=Green ctermbg=NONE guifg=#98C379 guibg=NONE
 
 if v:vim_did_enter
   call s:Start()
